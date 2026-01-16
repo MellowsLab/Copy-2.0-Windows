@@ -1,8 +1,2 @@
 pyperclip>=1.8.2
 platformdirs>=4.0.0
-
-“Run Copy2.exe”
-
-“Data saved under %APPDATA%\copy2 (or similar)”
-
-“If Windows SmartScreen warns, click More info → Run anyway”
