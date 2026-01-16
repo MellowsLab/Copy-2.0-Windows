@@ -19,7 +19,9 @@ if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
 if exist Copy2.spec del /q Copy2.spec
 
-python -m PyInstaller --noconsole --onefile --name "Copy2" Copy2_Windows.py || goto :fail
+python -m PyInstaller --noconsole --onefile --name "Copy2" Copy2_Windows.py
+python -m PyInstaller --noconsole --onefile --name "Copy2_Uninstall" Copy2_Uninstall.py
+
 
 echo.
 echo [INFO] Build complete. Your EXE is in: %cd%\dist\Copy2.exe
