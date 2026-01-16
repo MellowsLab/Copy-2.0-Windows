@@ -1,37 +1,52 @@
-\
-# Copy 2.0 (Windows Portable)
+# Copy 2.0 (Windows)
 
-This ZIP contains a Windows-portable version of Copy 2.0 that you can package into a **single .exe** (no installer).
+Copy 2.0 is a lightweight clipboard history manager for Windows with a simple, fast GUI.  
+It continuously tracks your clipboard, lets you browse and search previous copies, pin favorites, and quickly re-copy or combine items.
 
-## Build a single EXE
-1. Install Python (3.11 or 3.12 recommended) from python.org and ensure **Add Python to PATH** is checked.
-2. Open CMD or PowerShell in this folder.
-3. Run:
+## Download (recommended)
 
-### CMD
+Use the **Releases** page to download the latest portable ZIP:
+- `Copy2.exe` (the app)
+- `Copy2_Uninstall.exe` (removes all Copy 2.0 user data and can optionally delete the portable EXEs)
+
+## Run
+
+1. Download the ZIP from **Releases**
+2. Extract anywhere (e.g. Desktop)
+3. Double-click `Copy2.exe`
+
+## Uninstall / remove all data
+
+Run `Copy2_Uninstall.exe` and confirm the prompts.
+
+**What it removes**
+- Your per-user Copy 2.0 data (history/config/favorites) stored under AppData  
+  Typical path:
+  - `%LOCALAPPDATA%\MellowsLab\copy2\`
+
+It also checks `%APPDATA%` (Roaming) as a fallback.
+
+## Build the EXEs yourself
+
+### Requirements
+- Python 3.11/3.12 recommended (from python.org)
+- Ensure **Add Python to PATH** is enabled during install
+
+### Build
+Open CMD in the repo folder and run:
 ```bat
 build.bat
 ```
 
-### PowerShell
-```powershell
-.\build.ps1
-```
-
-Output:
+Outputs:
 - `dist\Copy2.exe`
+- `dist\Copy2_Uninstall.exe`
 
-## Run from source (optional)
-```powershell
-python .\Copy2_Windows.py
-```
+## Notes
+- If Windows SmartScreen appears: **More info → Run anyway**
+- This is a portable app: no installer, no admin required
 
-## Shortcuts (when app is focused)
-- Ctrl+F: focus search
-- Enter: search
-- Ctrl+C: copy selected
-- Del: delete selected
-- Ctrl+E: export
-- Ctrl+I: import
-- Ctrl+L: clear all
-- Esc: clear search
+---
+
+## License
+MIT
