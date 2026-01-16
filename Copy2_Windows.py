@@ -1,7 +1,6 @@
 """
-Copy 2.0 (Windows) — Modern UI Edition (Drop-in Replacement)
+Copy 2.0 (Windows) — Modern UI Edition
 
-What’s included (per your requests):
 1) Favorites are protected
    - “Clean” removes ONLY non-favorites; favorites remain.
    - Favorites are NEVER auto-evicted when max_history is reached.
@@ -100,7 +99,7 @@ APP_ID = "copy2"
 VENDOR = "MellowsLab"
 
 # IMPORTANT: keep this in sync with your release tags, e.g. "v1.0.2"
-APP_VERSION = "v1.0.1"
+APP_VERSION = "v1.0.3"
 
 # GitHub repo to check
 GITHUB_OWNER = "MellowsLab"
