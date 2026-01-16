@@ -49,4 +49,4 @@ Outputs:
 ---
 
 ## License
-MIT
+Private License
