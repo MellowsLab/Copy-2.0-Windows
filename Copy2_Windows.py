@@ -1,38 +1,38 @@
 """
-Copy 2.0 (Windows) — Modern UI Edition
+Copy 2.0 (Windows) — Modern UI Edition (Improved)
 
-1) Favorites are protected
-   - “Clean” removes ONLY non-favorites; favorites remain.
-   - Favorites are NEVER auto-evicted when max_history is reached.
-   - If max_history is reached and ONLY favorites remain (or favorites >= max_history), new items will NOT be added;
-     you will be prompted to increase max_history.
-2) Soft cap + hard cap notifications
-   - Soft cap: when you hit your configured max_history, you get a prompt (once per run) suggesting increasing it.
-   - Hard cap: when you hit hard-coded storage limits, you get “allocated memory used up” style prompt; no new items are stored.
-3) Controls / Hotkeys viewer
-   - Settings dialog includes a “Controls” section showing all hotkeys.
-   - Main buttons include hover tooltips showing hotkeys (ttkbootstrap) or a simple fallback tooltip.
-4) Import/Export hardened
-   - Export includes history + favorites + settings.
-   - Import merges, stable de-dupes, ensures favorites exist in history, then enforces caps safely.
-5) Auto-updater (GitHub Releases)
-   - On launch: checks GitHub releases for a newer tag/version.
-   - “Check Updates” button to manually check.
-   - If update available: prompt to update now.
-   - Downloads the Release Asset (preferred) or falls back to a .zip link inside release notes (user-attachments).
-   - Validates download (size/signature) and uses safe swap (backup + rollback) then restarts.
-   - Logs:
-       <data_dir>/update_check.log
-       <data_dir>/update_install.log
+Key fixes added:
+- Favorites are NEVER removed by "Clean" or by history-cap pruning.
+- When max history is reached, you are notified to increase it.
+- Hard cap protection (HARD_MAX_HISTORY): if you hit it and cannot prune (because favorites), you are warned.
+- Settings now includes a Controls/Hotkeys section.
+- Robust GitHub update checker (startup + button):
+  - Uses GitHub Releases API
+  - Falls back to parsing release body for .zip links (including user-attachments)
+- Robust auto-update installer:
+  - Downloads ZIP/EXE
+  - Stages Copy2.exe
+  - Writes a .bat that:
+      - waits for current PID to exit
+      - backs up current EXE
+      - copies new EXE into place
+      - clears PyInstaller/Python env vars
+      - runs self-test with retries
+      - rolls back automatically on failure
+  - Logs: update_check.log, update_install.log, update_bat.log
 
 Dependencies:
   pyperclip
   platformdirs
-Recommended (modern UI):
+Optional (recommended UI):
   ttkbootstrap
 
-Build:
+Build (onefile recommended for auto-update):
   python -m PyInstaller --noconsole --onefile --name "Copy2" Copy2_Windows.py
+
+Note:
+- Auto-update is ONLY supported for frozen onefile builds.
+- If you are running an onedir build (folder next to exe), updates will open the release page instead.
 """
 
 from __future__ import annotations
@@ -40,17 +40,14 @@ from __future__ import annotations
 import json
 import os
 import re
-import ssl
 import sys
 import time
-import shutil
 import zipfile
 import tempfile
 import threading
 import subprocess
-import urllib.request
-import urllib.error
 import webbrowser
+from collections import deque
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
@@ -67,10 +64,6 @@ USE_TTKB = True
 try:
     import ttkbootstrap as tb
     from ttkbootstrap.constants import *
-    try:
-        from ttkbootstrap.tooltip import ToolTip as TBToolTip
-    except Exception:
-        TBToolTip = None
 except Exception:
     USE_TTKB = False
     from tkinter import ttk  # type: ignore
@@ -90,41 +83,32 @@ except Exception:
     TOP = tk.TOP
     BOTTOM = tk.BOTTOM
 
-
 # -----------------------------
-# App / Update config
+# App constants
 # -----------------------------
 APP_NAME = "Copy 2.0"
 APP_ID = "copy2"
 VENDOR = "MellowsLab"
 
-# IMPORTANT: keep this in sync with your release tags, e.g. "v1.0.2"
-APP_VERSION = "v1.0.3"
-
-# GitHub repo to check
-GITHUB_OWNER = "MellowsLab"
-GITHUB_REPO = "Copy-2.0-Windows"
-
-# Optional: hint to pick the right asset if multiple ZIPs exist
-GITHUB_ASSET_NAME_HINT = "Copy2"  # substring match
-
-# Update behavior
-CHECK_UPDATES_ON_STARTUP = True
-STARTUP_UPDATE_DELAY_MS = 900
+# App version (display + update compare)
+APP_VERSION = "1.0.4"  # <-- keep this in sync with your build/tag
 
 DEFAULT_MAX_HISTORY = 50
 DEFAULT_POLL_MS = 400
 
+# Hard cap: beyond this, the UI will not allow increasing max_history
+# and the app will warn that you have used all allocated memory.
+HARD_MAX_HISTORY = 500
+
+# GitHub update config
+GITHUB_OWNER = "MellowsLab"
+GITHUB_REPO = "Copy-2.0-Windows"
+GITHUB_LATEST_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+
 # -----------------------------
-# Hard-coded storage limits (“allocated memory”)
+# Utilities
 # -----------------------------
-HARD_MAX_ITEMS = 2000          # total items in history (favorites included)
-HARD_MAX_TOTAL_CHARS = 5_000_000  # sum of string lengths across all items (approx memory bound)
-
-# PyInstaller onefile sanity: minimum expected EXE size
-MIN_EXE_BYTES = 5_000_000
-
-
 def now_ts() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -146,34 +130,49 @@ def safe_json_save(path: Path, obj) -> None:
         pass
 
 
-def parse_version_tag(tag: str) -> tuple[int, int, int, int]:
+def _norm_ver(v: str) -> tuple[int, int, int]:
     """
-    Accepts: v1.2.3, 1.2.3, 1.2, v1.2.3-beta (beta -> lower priority)
-    Returns (major, minor, patch, preflag) where preflag=1 means prerelease.
+    Normalize versions like:
+      "v1.2.3" -> (1,2,3)
+      "1.2"   -> (1,2,0)
+      "1"     -> (1,0,0)
     """
-    t = (tag or "").strip()
-    if t.lower().startswith("v"):
-        t = t[1:]
-    preflag = 0
-    # crude prerelease detection
-    if re.search(r"[a-zA-Z]", t):
-        preflag = 1
-    # keep numeric parts only
-    m = re.match(r"^\s*(\d+)(?:\.(\d+))?(?:\.(\d+))?", t)
-    if not m:
-        return (0, 0, 0, 1)
-    maj = int(m.group(1) or 0)
-    minr = int(m.group(2) or 0)
-    pat = int(m.group(3) or 0)
-    return (maj, minr, pat, preflag)
+    v = (v or "").strip()
+    v = v[1:] if v.lower().startswith("v") else v
+    parts = re.findall(r"\d+", v)
+    nums = [int(x) for x in parts[:3]] + [0, 0, 0]
+    return (nums[0], nums[1], nums[2])
 
 
-def is_newer(latest: str, installed: str) -> bool:
-    return parse_version_tag(latest) > parse_version_tag(installed)
+def is_newer_version(latest: str, installed: str) -> bool:
+    return _norm_ver(latest) > _norm_ver(installed)
 
 
-class SimpleTooltip:
-    """Small tooltip fallback if ttkbootstrap ToolTip is unavailable."""
+def is_frozen() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
+def is_onedir_frozen(exe_path: Path) -> bool:
+    """
+    Best-effort detection: if common runtime files exist next to exe,
+    it's likely an onedir build. Onefile typically does NOT have these.
+    """
+    parent = exe_path.parent
+    markers = [
+        "python312.dll",
+        "python311.dll",
+        "python310.dll",
+        "base_library.zip",
+        "libcrypto-3.dll",
+        "libssl-3.dll",
+    ]
+    return any((parent / m).exists() for m in markers)
+
+
+# -----------------------------
+# Simple tooltip (hoverover hotkeys)
+# -----------------------------
+class ToolTip:
     def __init__(self, widget, text: str):
         self.widget = widget
         self.text = text
@@ -181,30 +180,43 @@ class SimpleTooltip:
         widget.bind("<Enter>", self._show)
         widget.bind("<Leave>", self._hide)
 
-    def _show(self, _e=None):
+    def _show(self, _event=None):
         if self.tip or not self.text:
             return
         try:
             x = self.widget.winfo_rootx() + 10
-            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
             self.tip = tk.Toplevel(self.widget)
             self.tip.wm_overrideredirect(True)
             self.tip.wm_geometry(f"+{x}+{y}")
-            lbl = tk.Label(self.tip, text=self.text, background="#111", foreground="#fff",
-                           relief="solid", borderwidth=1, padx=6, pady=3)
+            lbl = tk.Label(
+                self.tip,
+                text=self.text,
+                justify="left",
+                background="#1f1f1f",
+                foreground="white",
+                relief="solid",
+                borderwidth=1,
+                padx=8,
+                pady=4,
+                font=("Segoe UI", 9),
+            )
             lbl.pack()
         except Exception:
             self.tip = None
 
-    def _hide(self, _e=None):
-        try:
-            if self.tip:
+    def _hide(self, _event=None):
+        if self.tip:
+            try:
                 self.tip.destroy()
-        except Exception:
-            pass
-        self.tip = None
+            except Exception:
+                pass
+            self.tip = None
 
 
+# -----------------------------
+# Settings
+# -----------------------------
 @dataclass
 class Settings:
     max_history: int = DEFAULT_MAX_HISTORY
@@ -212,6 +224,7 @@ class Settings:
     session_only: bool = False
     reverse_lines_copy: bool = False
     theme: str = "flatly"
+    check_updates_on_launch: bool = True
 
     @staticmethod
     def from_dict(d: dict) -> "Settings":
@@ -221,38 +234,186 @@ class Settings:
         s.session_only = bool(d.get("session_only", False))
         s.reverse_lines_copy = bool(d.get("reverse_lines_copy", False))
         s.theme = str(d.get("theme", "flatly"))
+        s.check_updates_on_launch = bool(d.get("check_updates_on_launch", True))
 
-        # soft bounds for user config
-        s.max_history = max(5, min(500, s.max_history))
+        s.max_history = max(5, min(HARD_MAX_HISTORY, s.max_history))
         s.poll_ms = max(100, min(5000, s.poll_ms))
         return s
 
 
+# -----------------------------
+# GitHub update helpers (urllib only, no extra deps)
+# -----------------------------
+def _http_get_json(url: str, timeout: int = 10) -> dict | None:
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": f"{APP_NAME}/{APP_VERSION} ({sys.platform})",
+                "Accept": "application/vnd.github+json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read()
+        return json.loads(data.decode("utf-8", errors="ignore"))
+    except Exception:
+        return None
+
+
+def _http_download(url: str, out_path: Path, timeout: int = 30) -> tuple[int, int | None]:
+    """
+    Returns: (downloaded_bytes, expected_bytes or None)
+    """
+    import urllib.request
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": f"{APP_NAME}/{APP_VERSION} ({sys.platform})",
+            "Accept": "*/*",
+        },
+    )
+
+    expected = None
+    downloaded = 0
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        try:
+            cl = resp.headers.get("Content-Length")
+            if cl:
+                expected = int(cl)
+        except Exception:
+            expected = None
+
+        with open(out_path, "wb") as f:
+            while True:
+                chunk = resp.read(1024 * 256)
+                if not chunk:
+                    break
+                f.write(chunk)
+                downloaded += len(chunk)
+
+    return downloaded, expected
+
+
+def _parse_zip_url_from_body(body: str) -> str | None:
+    """
+    Fallback when release assets are empty (e.g., "user-attachments" links).
+    Extract the first URL ending with .zip (or .exe) from the release body.
+    """
+    if not body:
+        return None
+
+    # Match markdown links and raw URLs
+    urls = re.findall(r"(https?://[^\s)]+)", body, flags=re.IGNORECASE)
+    # prefer .zip
+    for u in urls:
+        if u.lower().endswith(".zip"):
+            return u
+    # fallback .exe
+    for u in urls:
+        if u.lower().endswith(".exe"):
+            return u
+    return None
+
+
+def get_latest_release_info() -> dict | None:
+    """
+    Returns dict with:
+      version: "v1.2.3"
+      html_url: release page
+      asset_url: direct download url (.zip preferred)
+      asset_name: filename
+    """
+    j = _http_get_json(GITHUB_LATEST_API, timeout=10)
+    if not isinstance(j, dict):
+        return None
+
+    tag = str(j.get("tag_name") or "").strip()
+    html_url = str(j.get("html_url") or GITHUB_RELEASES_PAGE).strip()
+
+    asset_url = ""
+    asset_name = ""
+
+    assets = j.get("assets", [])
+    if isinstance(assets, list):
+        # Prefer .zip assets first
+        zip_assets = [a for a in assets if str(a.get("name", "")).lower().endswith(".zip")]
+        exe_assets = [a for a in assets if str(a.get("name", "")).lower().endswith(".exe")]
+
+        chosen = None
+        if zip_assets:
+            # prefer a common name if present
+            preferred = None
+            for a in zip_assets:
+                nm = str(a.get("name", "")).lower()
+                if nm in ("copy2.zip", "copy-2.0.zip", "copy2win.zip"):
+                    preferred = a
+                    break
+            chosen = preferred or zip_assets[0]
+        elif exe_assets:
+            chosen = exe_assets[0]
+
+        if chosen:
+            asset_url = str(chosen.get("browser_download_url") or "").strip()
+            asset_name = str(chosen.get("name") or "").strip()
+
+    # Fallback: parse release body for a zip/exe link
+    if not asset_url:
+        body = str(j.get("body") or "")
+        u = _parse_zip_url_from_body(body)
+        if u:
+            asset_url = u
+            asset_name = u.split("/")[-1]
+
+    return {
+        "version": tag,
+        "html_url": html_url,
+        "asset_url": asset_url,
+        "asset_name": asset_name,
+    }
+
+
+# -----------------------------
+# Main app logic
+# -----------------------------
 class Copy2AppBase:
     """Shared logic for both ttkbootstrap and ttk fallback variants."""
 
-    # -----------------------------
-    # init / persistence
-    # -----------------------------
     def _init_state(self):
         self.data_dir = Path(user_data_dir(APP_ID, VENDOR))
         self.settings_path = self.data_dir / "config.json"
         self.history_path = self.data_dir / "history.json"
         self.favs_path = self.data_dir / "favorites.json"
 
+        self.log_update_check = self.data_dir / "update_check.log"
+        self.log_update_install = self.data_dir / "update_install.log"
+
         self.settings = Settings.from_dict(safe_json_load(self.settings_path, {}))
 
-        # Store history as a plain list (newest last). We enforce caps ourselves to protect favorites.
-        raw_hist = safe_json_load(self.history_path, [])
-        self.history: list[str] = [x for x in raw_hist if isinstance(x, str)]
+        # Normalize stored favorites to unique list
+        favs = safe_json_load(self.favs_path, [])
+        if isinstance(favs, list):
+            favs = [x for x in favs if isinstance(x, str)]
+        else:
+            favs = []
+        # preserve order, unique
+        seen = set()
+        self.favorites = []
+        for x in favs:
+            if x not in seen:
+                self.favorites.append(x)
+                seen.add(x)
 
-        raw_favs = safe_json_load(self.favs_path, [])
-        self.favorites: list[str] = [x for x in raw_favs if isinstance(x, str)]
+        hist = safe_json_load(self.history_path, [])
+        if isinstance(hist, list):
+            hist = [x for x in hist if isinstance(x, str)]
+        else:
+            hist = []
 
-        # Ensure favorites exist in history
-        for f in self.favorites:
-            if f not in self.history:
-                self.history.append(f)
+        self.history = deque(hist, maxlen=self.settings.max_history)
 
         self.paused = False
         self.last_clip = ""
@@ -273,18 +434,47 @@ class Copy2AppBase:
         self._sel_order: list[int] = []
 
         # Preview edit model
-        self._selected_item_text: str | None = None
+        self._selected_item_text: str | None = None  # original (non-reversed) selected item
         self._preview_dirty = False
 
-        # Cap notifications (per run)
-        self._notified_soft_cap = False
-        self._notified_hard_cap = False
+        # One-shot notifications
+        self._warned_limit_reached = False
+        self._warned_fav_block = False
 
-        # Update check error stash
-        self._last_update_error = ""
+        # Hotkeys map (shown in settings)
+        self.HOTKEYS = {
+            "Focus Search": "Ctrl+F",
+            "Find": "Enter",
+            "Copy Preview": "Ctrl+C",
+            "Delete Selected": "Del",
+            "Export": "Ctrl+E",
+            "Import": "Ctrl+I",
+            "Clean (keep favorites)": "Ctrl+L",
+            "Save Preview Edit": "Ctrl+S",
+            "Revert Preview Edit": "Esc",
+            "Check Updates": "(Button)",
+        }
 
-        # Ensure caps are enforced at startup
-        self._enforce_caps_and_persist()
+        # Ensure favorites remain present in history (optional)
+        self._ensure_favorites_present()
+
+    def _log_check(self, msg: str):
+        try:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            self.log_update_check.write_text("", encoding="utf-8") if not self.log_update_check.exists() else None
+            with self.log_update_check.open("a", encoding="utf-8", errors="ignore") as f:
+                f.write(f"{now_ts()}  {msg}\n")
+        except Exception:
+            pass
+
+    def _log_install(self, msg: str):
+        try:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            self.log_update_install.write_text("", encoding="utf-8") if not self.log_update_install.exists() else None
+            with self.log_update_install.open("a", encoding="utf-8", errors="ignore") as f:
+                f.write(f"{now_ts()}  {msg}\n")
+        except Exception:
+            pass
 
     def _persist(self):
         if self.settings.session_only:
@@ -293,80 +483,77 @@ class Copy2AppBase:
         safe_json_save(self.history_path, list(self.history))
         safe_json_save(self.favs_path, list(self.favorites))
 
-    def _log_update_check(self, msg: str):
+    # -----------------------------
+    # Favorites & capacity management
+    # -----------------------------
+    def _ensure_favorites_present(self):
+        """
+        If a favorite exists but isn't in history anymore, we do not force-add it automatically
+        (it may have been manually removed). This function is left as a hook if you want that behavior.
+        """
+        return
+
+    def _prune_preserving_favorites(self, items: list[str], capacity: int) -> tuple[list[str], bool]:
+        """
+        Prune oldest NON-favorites first to fit capacity.
+        Returns: (new_items, success)
+        """
+        if len(items) <= capacity:
+            return items, True
+
+        favset = set(self.favorites)
+
+        # Remove from the front (oldest) while over capacity, skipping favorites
+        i = 0
+        out = items[:]
+        while len(out) > capacity and i < len(out):
+            if out[i] in favset:
+                i += 1
+                continue
+            out.pop(i)
+
+        if len(out) <= capacity:
+            return out, True
+
+        # If we are still over capacity, it means favorites alone exceed capacity
+        return out, False
+
+    def _notify_limit_reached(self):
+        if self._warned_limit_reached:
+            return
+        self._warned_limit_reached = True
         try:
-            p = self.data_dir / "update_check.log"
-            p.parent.mkdir(parents=True, exist_ok=True)
-            with p.open("a", encoding="utf-8", errors="ignore") as f:
-                f.write(f"{now_ts()}  {msg}\n")
+            messagebox.showinfo(
+                APP_NAME,
+                f"You have reached your maximum stored items ({self.settings.max_history}).\n\n"
+                "Consider increasing Max history in Settings, or Clean to remove non-favorites.",
+            )
         except Exception:
             pass
 
-    def _log_update_install(self, msg: str):
+    def _notify_hard_cap_reached(self):
         try:
-            p = self.data_dir / "update_install.log"
-            p.parent.mkdir(parents=True, exist_ok=True)
-            with p.open("a", encoding="utf-8", errors="ignore") as f:
-                f.write(f"{now_ts()}  {msg}\n")
+            messagebox.showwarning(
+                APP_NAME,
+                f"You have reached the hard-coded limit ({HARD_MAX_HISTORY}).\n\n"
+                "You have used up all allocated memory for stored items.\n"
+                "Please reconsider removing old copies from Favorites or reducing stored history.",
+            )
         except Exception:
             pass
 
-    # -----------------------------
-    # Caps enforcement (favorites protected)
-    # -----------------------------
-    def _total_chars(self) -> int:
-        return sum(len(x) for x in self.history)
-
-    def _hard_cap_reached(self) -> bool:
-        if len(self.history) >= HARD_MAX_ITEMS:
-            return True
-        if self._total_chars() >= HARD_MAX_TOTAL_CHARS:
-            return True
-        return False
-
-    def _enforce_caps_and_persist(self):
-        """
-        Enforce soft cap (settings.max_history) by evicting oldest NON-favorites first.
-        If favorites prevent eviction enough, we allow the list to remain above max_history.
-        """
-        # Stable de-dupe: keep latest occurrence
-        seen = set()
-        out = []
-        for item in reversed(self.history):
-            if item not in seen:
-                out.append(item)
-                seen.add(item)
-        out.reverse()
-        self.history = out
-
-        # Ensure favorites exist in history
-        for f in self.favorites:
-            if f not in self.history:
-                self.history.append(f)
-
-        # Enforce hard caps by evicting non-favorites oldest-first; if impossible, keep and block new writes later
-        # NOTE: we never delete favorites automatically.
-        def evict_one_nonfav() -> bool:
-            for i, item in enumerate(self.history):
-                if item not in self.favorites:
-                    del self.history[i]
-                    return True
-            return False
-
-        while len(self.history) > HARD_MAX_ITEMS:
-            if not evict_one_nonfav():
-                break
-        while self._total_chars() > HARD_MAX_TOTAL_CHARS:
-            if not evict_one_nonfav():
-                break
-
-        # Soft cap: try to get down to settings.max_history by removing non-favorites
-        while len(self.history) > self.settings.max_history:
-            if not evict_one_nonfav():
-                # can't evict without removing favorites
-                break
-
-        self._persist()
+    def _notify_favorites_blocking(self):
+        if self._warned_fav_block:
+            return
+        self._warned_fav_block = True
+        try:
+            messagebox.showwarning(
+                APP_NAME,
+                "Cannot add new clipboard item because your Favorites occupy the entire capacity.\n\n"
+                "Increase Max history in Settings or remove some items from Favorites.",
+            )
+        except Exception:
+            pass
 
     # -----------------------------
     # Clipboard polling
@@ -387,85 +574,39 @@ class Copy2AppBase:
 
         self._poll_job = self.after(self.settings.poll_ms, self._poll_clipboard)
 
-    def _notify_soft_cap_once(self):
-        if self._notified_soft_cap:
-            return
-        self._notified_soft_cap = True
-        try:
-            if messagebox.askyesno(
-                APP_NAME,
-                f"You have reached your maximum stored items ({self.settings.max_history}).\n\n"
-                "Older non-favorite items will be removed to make space.\n"
-                "Favorites are protected.\n\n"
-                "Would you like to open Settings to increase the limit?"
-            ):
-                self._open_settings()
-        except Exception:
-            pass
-
-    def _notify_hard_cap_once(self):
-        if self._notified_hard_cap:
-            return
-        self._notified_hard_cap = True
-        try:
-            messagebox.showwarning(
-                APP_NAME,
-                "You have used up all allocated storage for clipboard history.\n\n"
-                "No new items will be stored until you remove old items (preferably non-favorites),\n"
-                "or reduce total stored content.\n\n"
-                "Favorites are protected from automatic removal."
-            )
-        except Exception:
-            pass
-
     def _add_history_item(self, text: str):
-        text = (text or "").strip("\r\n")
-        if not text:
+        items = list(self.history)
+
+        if items and items[-1] == text:
             return
 
-        # Hard cap: refuse to add if we cannot make room without deleting favorites
-        if self._hard_cap_reached():
-            # Try evicting non-favorites to get under hard caps
-            before = len(self.history)
-            self._enforce_caps_and_persist()
-            if self._hard_cap_reached() and len(self.history) == before:
-                self._notify_hard_cap_once()
-                return
+        # Stable de-dupe: remove previous occurrences
+        if text in items:
+            items = [x for x in items if x != text]
+        items.append(text)
 
-        # De-dupe: remove existing occurrence
-        if text in self.history:
-            self.history = [x for x in self.history if x != text]
-        self.history.append(text)
+        cap = self.settings.max_history
 
-        # If we are at/over soft cap, enforce (evict non-favorites only)
-        if len(self.history) >= self.settings.max_history:
-            self._notify_soft_cap_once()
+        # If at/over cap, prune preserving favorites
+        if len(items) >= cap:
+            self._notify_limit_reached()
 
-        # Enforce caps (soft + hard)
-        self._enforce_caps_and_persist()
+        pruned, ok = self._prune_preserving_favorites(items, cap)
 
-        # If we still exceed soft cap and cannot evict (favorites block), refuse storing NEW non-favorite items
-        if len(self.history) > self.settings.max_history:
-            # If text itself is not favorite and we couldn't make room, undo append
-            if text not in self.favorites:
-                # remove the newest we just added
-                try:
-                    self.history = [x for x in self.history if x != text]
-                except Exception:
-                    pass
-                self._persist()
-                try:
-                    messagebox.showwarning(
-                        APP_NAME,
-                        f"Cannot store more items because favorites are protected and your limit is {self.settings.max_history}.\n\n"
-                        "Increase Max history in Settings, or remove some favorites."
-                    )
-                except Exception:
-                    pass
-                self._refresh_list(select_last=True)
-                return
+        if not ok:
+            # Favorites exceed capacity -> block adding the new item
+            # Keep history unchanged, do not overwrite favorites.
+            self._notify_favorites_blocking()
 
+            # If they are already at hard cap, give stronger warning.
+            if self.settings.max_history >= HARD_MAX_HISTORY:
+                self._notify_hard_cap_reached()
+            return
+
+        items = pruned
+        self.history = deque(items, maxlen=cap)
         self._refresh_list(select_last=True)
+        self._persist()
 
     # -----------------------------
     # List/view helpers
@@ -507,7 +648,7 @@ class Copy2AppBase:
             self._on_select()
 
         self.status_var.set(
-            f"Items: {len(self.history)}   Favorites: {len(self.favorites)}   Data: {self.data_dir}"
+            f"v{APP_VERSION}   Items: {len(self.history)}   Favorites: {len(self.favorites)}   Data: {self.data_dir}"
         )
 
     def _get_selected_indices(self) -> list[int]:
@@ -537,6 +678,7 @@ class Copy2AppBase:
         self.preview.insert("1.0", text)
         self._preview_dirty = not mark_clean
         self._update_preview_dirty_ui()
+
         if self.search_query:
             self._highlight_query_in_preview(self.search_query)
 
@@ -565,6 +707,9 @@ class Copy2AppBase:
         display = self._get_preview_display_text_for_item(t)
         self._set_preview_text(display, mark_clean=True)
 
+        if self.search_query:
+            self._highlight_query_in_preview(self.search_query)
+
     def _reselect_current_item(self):
         if not self._selected_item_text:
             return
@@ -583,6 +728,7 @@ class Copy2AppBase:
     # -----------------------------
     def _on_listbox_select_event(self, _event=None):
         current = set(self.listbox.curselection())
+
         added = current - self._prev_sel_set
         removed = self._prev_sel_set - current
 
@@ -643,6 +789,7 @@ class Copy2AppBase:
             current = self.preview.get("1.0", tk.END).rstrip("\n")
             self._preview_dirty = (current != baseline)
         self._update_preview_dirty_ui()
+
         if self.search_query:
             self._highlight_query_in_preview(self.search_query)
 
@@ -664,18 +811,24 @@ class Copy2AppBase:
             messagebox.showwarning(APP_NAME, "Cannot save an empty item.")
             return
 
-        # Replace old in history
-        self.history = [x for x in self.history if x != old]
-        self.history.append(new)
+        items = [x for x in self.history if x != old]
+        items.append(new)
 
-        # Maintain favorite mapping
+        # favorites map update
         if old in self.favorites:
             self.favorites = [new if x == old else x for x in self.favorites]
 
+        # prune if needed (preserve favorites)
+        cap = self.settings.max_history
+        pruned, ok = self._prune_preserving_favorites(items, cap)
+        if not ok:
+            self._notify_favorites_blocking()
+            return
+
+        self.history = deque(pruned, maxlen=cap)
         self._selected_item_text = new
         self._preview_dirty = False
-
-        self._enforce_caps_and_persist()
+        self._persist()
         self._refresh_list(select_last=True)
         self.status_var.set(f"Saved edits — {now_ts()}")
 
@@ -702,10 +855,9 @@ class Copy2AppBase:
         if not t:
             return
 
-        # Remove from history
-        self.history = [x for x in self.history if x != t]
+        items = [x for x in self.history if x != t]
+        self.history = deque(items, maxlen=self.settings.max_history)
 
-        # Remove from favorites if present
         if t in self.favorites:
             self.favorites = [x for x in self.favorites if x != t]
 
@@ -713,33 +865,27 @@ class Copy2AppBase:
             self._selected_item_text = None
             self._set_preview_text("", mark_clean=True)
 
-        self._enforce_caps_and_persist()
         self._refresh_list(select_last=True)
-
-    def _clean_history(self):
-        """
-        "Clean" keeps favorites; removes non-favorites only.
-        """
-        if not messagebox.askyesno(APP_NAME, "Clean history?\n\nThis will remove ALL non-favorite items.\nFavorites will remain."):
-            return
-        self.history = [x for x in self.history if x in self.favorites]
-        self._selected_item_text = None
-        self._set_preview_text("", mark_clean=True)
-        self._enforce_caps_and_persist()
-        self._refresh_list(select_last=True)
-
-    def _clear_all_history(self):
-        """
-        Full wipe (including favorites) – kept as a context-menu option.
-        """
-        if not messagebox.askyesno(APP_NAME, "Clear ALL history items (including favorites)?"):
-            return
-        self.history = []
-        self.favorites = []
-        self._selected_item_text = None
-        self._set_preview_text("", mark_clean=True)
         self._persist()
+
+    def _clean_keep_favorites(self):
+        """
+        Clean action: remove all NON-favorites, keep favorites.
+        This matches your requirement: favorites stay behind after cleaning.
+        """
+        if not messagebox.askyesno(APP_NAME, "Clean history and keep Favorites only?"):
+            return
+
+        favset = set(self.favorites)
+        kept = [x for x in self.history if x in favset]
+
+        self.history = deque(kept, maxlen=self.settings.max_history)
+
+        self._selected_item_text = None
+        self._set_preview_text("", mark_clean=True)
         self._refresh_list(select_last=True)
+        self._persist()
+        self.status_var.set(f"Cleaned (kept favorites) — {now_ts()}")
 
     def _toggle_favorite_selected(self):
         t = self._get_selected_text()
@@ -750,13 +896,9 @@ class Copy2AppBase:
             self.favorites = [x for x in self.favorites if x != t]
         else:
             self.favorites.append(t)
-            # ensure favorite exists in history
-            if t not in self.history:
-                self.history.append(t)
 
-        self._enforce_caps_and_persist()
         self._refresh_list()
-        self.status_var.set(f"Favorites updated — {now_ts()}")
+        self._persist()
 
     def _combine_selected(self):
         sel = self._get_selected_indices()
@@ -777,6 +919,7 @@ class Copy2AppBase:
 
         combined = "\n".join(parts)
         self._add_history_item(combined)
+
         self._selected_item_text = combined
         self._set_preview_text(self._get_preview_display_text_for_item(combined), mark_clean=True)
         self.status_var.set(f"Combined {len(parts)} items into new entry — {now_ts()}")
@@ -800,6 +943,7 @@ class Copy2AppBase:
 
         start_index = f"1.0+{m.start()}c"
         end_index = f"1.0+{m.end()}c"
+
         self.preview.tag_add("match", start_index, end_index)
         try:
             self.preview.tag_config("match", background="#2b78ff", foreground="white")
@@ -818,7 +962,7 @@ class Copy2AppBase:
             self.preview.tag_remove("match", "1.0", tk.END)
             return
 
-        for item in self.history:
+        for item in list(self.history):
             if q.lower() in item.lower():
                 self.search_matches.append(item)
 
@@ -861,7 +1005,7 @@ class Copy2AppBase:
             self._highlight_query_in_preview(highlight_query)
 
     # -----------------------------
-    # Import / Export
+    # Import / Export (verified, stable)
     # -----------------------------
     def _export(self):
         path = filedialog.asksaveasfilename(
@@ -875,8 +1019,7 @@ class Copy2AppBase:
 
         data = {
             "exported_at": now_ts(),
-            "app": APP_NAME,
-            "version": APP_VERSION,
+            "app_version": APP_VERSION,
             "history": list(self.history),
             "favorites": list(self.favorites),
             "settings": asdict(self.settings),
@@ -903,13 +1046,7 @@ class Copy2AppBase:
                     if isinstance(item, str) and item.strip():
                         merged.append(item)
 
-            favs = list(self.favorites)
-            if isinstance(favorites, list):
-                for f in favorites:
-                    if isinstance(f, str) and f.strip() and f not in favs:
-                        favs.append(f)
-
-            # Stable de-dupe keep latest
+            # Stable de-dupe (keep latest occurrences)
             seen = set()
             out = []
             for item in reversed(merged):
@@ -918,43 +1055,30 @@ class Copy2AppBase:
                     seen.add(item)
             out.reverse()
 
-            self.history = out
-            self.favorites = favs
+            # merge favorites (unique)
+            if isinstance(favorites, list):
+                for x in favorites:
+                    if isinstance(x, str) and x not in self.favorites:
+                        self.favorites.append(x)
 
-            # Ensure favorites exist in history
-            for f in self.favorites:
-                if f not in self.history:
-                    self.history.append(f)
+            cap = self.settings.max_history
+            pruned, ok = self._prune_preserving_favorites(out, cap)
+            if not ok:
+                # If favorites exceed cap, keep only favorites that are present in the pruned list
+                self._notify_favorites_blocking()
 
-            self._enforce_caps_and_persist()
+            self.history = deque(pruned[-cap:], maxlen=cap)
+
             self._refresh_list(select_last=True)
+            self._persist()
             self.status_var.set(f"Imported — {path}")
 
         except Exception as e:
             messagebox.showerror(APP_NAME, f"Import failed:\n{e}")
 
     # -----------------------------
-    # Settings dialog (with Controls section)
+    # Settings dialog (+ Controls section)
     # -----------------------------
-    def _hotkeys_text(self) -> str:
-        return (
-            "Hotkeys / Controls\n"
-            "------------------\n"
-            "Ctrl+F  : Focus Search\n"
-            "Enter   : Run Search\n"
-            "Ctrl+C  : Copy Preview\n"
-            "Delete  : Delete Selected\n"
-            "Ctrl+S  : Save Preview Edit\n"
-            "Esc     : Revert Preview Edit\n"
-            "Ctrl+E  : Export\n"
-            "Ctrl+I  : Import\n"
-            "Ctrl+L  : Clean (non-favorites only)\n"
-            "\n"
-            "Notes:\n"
-            "- Favorites are protected from Clean and auto-eviction.\n"
-            "- Combine uses Ctrl+Click to multi-select in click order.\n"
-        )
-
     def _open_settings(self):
         dlg = tk.Toplevel(self)
         dlg.title("Settings")
@@ -986,39 +1110,47 @@ class Copy2AppBase:
         max_var = tk.StringVar(value=str(self.settings.max_history))
         poll_var = tk.StringVar(value=str(self.settings.poll_ms))
         sess_var = tk.BooleanVar(value=self.settings.session_only)
+        upd_var = tk.BooleanVar(value=self.settings.check_updates_on_launch)
+
         theme_var = tk.StringVar(value=self.settings.theme)
         themes = ["flatly", "litera", "cosmo", "sandstone", "minty", "darkly", "superhero", "cyborg"]
 
-        Label(frm, text="Max history (5–500):").grid(row=0, column=0, sticky="w")
-        Entry(frm, textvariable=max_var, width=12).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        Label(frm, text=f"Max history (5–{HARD_MAX_HISTORY}):").grid(row=0, column=0, sticky="w")
+        ent_mh = Entry(frm, textvariable=max_var, width=12)
+        ent_mh.grid(row=0, column=1, sticky="w", padx=(10, 0))
 
         Label(frm, text="Poll interval ms (100–5000):").grid(row=1, column=0, sticky="w", pady=(10, 0))
-        Entry(frm, textvariable=poll_var, width=12).grid(row=1, column=1, sticky="w", padx=(10, 0), pady=(10, 0))
+        ent_pm = Entry(frm, textvariable=poll_var, width=12)
+        ent_pm.grid(row=1, column=1, sticky="w", padx=(10, 0), pady=(10, 0))
 
         Checkbutton(frm, text="Session-only (do not save history)", variable=sess_var).grid(
             row=2, column=0, columnspan=2, sticky="w", pady=(10, 0)
         )
 
+        Checkbutton(frm, text="Check updates on launch", variable=upd_var).grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(10, 0)
+        )
+
         if USE_TTKB:
-            Label(frm, text="Theme:").grid(row=3, column=0, sticky="w", pady=(10, 0))
+            Label(frm, text="Theme:").grid(row=4, column=0, sticky="w", pady=(10, 0))
             cb = Combobox(frm, textvariable=theme_var, values=themes, width=18, state="readonly")
-            cb.grid(row=3, column=1, sticky="w", padx=(10, 0), pady=(10, 0))
+            cb.grid(row=4, column=1, sticky="w", padx=(10, 0), pady=(10, 0))
         else:
             Label(frm, text="(Install ttkbootstrap for modern themes)", foreground="#666").grid(
-                row=3, column=0, columnspan=2, sticky="w", pady=(10, 0)
+                row=4, column=0, columnspan=2, sticky="w", pady=(10, 0)
             )
 
-        # Controls section
-        Separator(frm).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(14, 10))
-        Label(frm, text="Controls / Hotkeys:").grid(row=5, column=0, columnspan=2, sticky="w")
+        Separator(frm).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(14, 10))
 
-        txt = tk.Text(frm, width=54, height=10, wrap="word")
-        txt.grid(row=6, column=0, columnspan=2, sticky="ew")
-        txt.insert("1.0", self._hotkeys_text())
-        txt.configure(state="disabled")
+        # Controls section
+        Label(frm, text="Controls / Hotkeys", font=("Segoe UI", 10, "bold")).grid(row=6, column=0, columnspan=2, sticky="w")
+
+        hot_txt = "\n".join([f"{k}: {v}" for k, v in self.HOTKEYS.items()])
+        lbl_hot = Label(frm, text=hot_txt, justify="left")
+        lbl_hot.grid(row=7, column=0, columnspan=2, sticky="w")
 
         btns = Frame(frm)
-        btns.grid(row=7, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        btns.grid(row=8, column=0, columnspan=2, sticky="e", pady=(14, 0))
 
         def save():
             try:
@@ -1028,18 +1160,32 @@ class Copy2AppBase:
                 messagebox.showerror(APP_NAME, "Please enter valid integers.")
                 return
 
-            mh = max(5, min(500, mh))
+            mh = max(5, min(HARD_MAX_HISTORY, mh))
             pm = max(100, min(5000, pm))
+
+            # If hard cap is reached, warn clearly
+            if mh >= HARD_MAX_HISTORY:
+                self._notify_hard_cap_reached()
 
             self.settings.max_history = mh
             self.settings.poll_ms = pm
             self.settings.session_only = bool(sess_var.get())
+            self.settings.check_updates_on_launch = bool(upd_var.get())
 
             if USE_TTKB:
                 self.settings.theme = str(theme_var.get()).strip() or "flatly"
 
-            self._enforce_caps_and_persist()
+            # Prune existing history to new capacity (preserve favorites)
+            items = list(self.history)
+            pruned, ok = self._prune_preserving_favorites(items, mh)
+            if not ok:
+                self._notify_favorites_blocking()
+                # If favorites exceed cap, keep as many as possible but never delete favorites automatically.
+                # We just keep current list and tell user to increase cap or reduce favorites.
+            self.history = deque(pruned[-mh:], maxlen=mh)
+
             self._refresh_list(select_last=True)
+            self._persist()
 
             if USE_TTKB and self.settings.theme != getattr(self, "_active_theme", self.settings.theme):
                 messagebox.showinfo(APP_NAME, "Theme saved. Close and reopen the app to apply the new theme.")
@@ -1061,15 +1207,12 @@ class Copy2AppBase:
         self.menu.add_separator()
         self.menu.add_command(label="Delete", command=self._delete_selected)
         self.menu.add_command(label="Combine Selected", command=self._combine_selected)
-        self.menu.add_separator()
-        self.menu.add_command(label="Clean (keep favorites)", command=self._clean_history)
-        self.menu.add_command(label="Clear ALL (including favorites)", command=self._clear_all_history)
 
         def popup(event):
             try:
                 idx = self.listbox.nearest(event.y)
                 if idx >= 0:
-                    if not (event.state & 0x0004):
+                    if not (event.state & 0x0004):  # Ctrl mask
                         self.listbox.selection_clear(0, tk.END)
                         self.listbox.selection_set(idx)
                         self._prev_sel_set = set(self.listbox.curselection())
@@ -1088,325 +1231,195 @@ class Copy2AppBase:
         self.listbox.bind("<Button-3>", popup)
 
     # -----------------------------
-    # Updater: GitHub checks + apply
+    # Update system
     # -----------------------------
-    def _is_frozen(self) -> bool:
-        return bool(getattr(sys, "frozen", False)) and hasattr(sys, "_MEIPASS")
-
-    def _github_api_latest_url(self) -> str:
-        return f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
-
-    def _fetch_latest_release_info(self) -> dict | None:
-        """
-        Returns: {version, html_url, notes, asset_name, asset_url, asset_size}
-        Prefers Release Assets; falls back to finding a .zip link in release notes if no assets exist.
-        """
-        url = self._github_api_latest_url()
-        self._last_update_error = ""
-        try:
-            ctx = ssl.create_default_context()
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": f"{APP_NAME}/{APP_VERSION}",
-                    "Accept": "application/vnd.github+json",
-                },
-                method="GET",
-            )
-            with urllib.request.urlopen(req, timeout=10, context=ctx) as r:
-                status = getattr(r, "status", 200)
-                raw = r.read().decode("utf-8", errors="replace")
-            if status >= 400:
-                self._log_update_check(f"HTTP {status}: {raw[:900]}")
-                self._last_update_error = f"GitHub returned HTTP {status}."
-                return None
-
-            data = json.loads(raw)
-            tag = str(data.get("tag_name", "")).strip()
-            html_url = str(data.get("html_url", "")).strip()
-            notes = str(data.get("body", "")).strip()
-
-            assets = data.get("assets", [])
-            if not isinstance(assets, list):
-                assets = []
-
-            zip_like = []
-            exe_like = []
-            hint = (GITHUB_ASSET_NAME_HINT or "").lower()
-
-            for a in assets:
-                if not isinstance(a, dict):
-                    continue
-                name = str(a.get("name", "")).strip()
-                dl = str(a.get("browser_download_url", "")).strip()
-                size = int(a.get("size", 0) or 0)
-                ctype = str(a.get("content_type", "")).lower()
-                if not name or not dl:
-                    continue
-                nlow = name.lower()
-                is_zip = nlow.endswith(".zip") or ("zip" in ctype)
-                is_exe = nlow.endswith(".exe") or ("msdownload" in ctype)
-                entry = {"name": name, "url": dl, "size": size}
-                if is_zip:
-                    zip_like.append(entry)
-                elif is_exe:
-                    exe_like.append(entry)
-
-            def pick_best(cands):
-                if not cands:
-                    return None
-                if hint:
-                    for c in cands:
-                        if hint in c["name"].lower():
-                            return c
-                return sorted(cands, key=lambda x: x.get("size", 0), reverse=True)[0]
-
-            chosen = pick_best(zip_like) or pick_best(exe_like)
-
-            # Fallback: notes body link (user-attachments or any .zip)
-            if not chosen:
-                m = re.search(r"(https://github\.com/user-attachments/files/[^\s)]+\.zip)", notes, re.IGNORECASE)
-                if not m:
-                    m = re.search(r"(https://github\.com/[^\s)]+\.zip)", notes, re.IGNORECASE)
-                if m:
-                    chosen = {"name": "linked_zip_from_notes.zip", "url": m.group(1), "size": 0}
-
-            info = {
-                "version": tag,
-                "html_url": html_url,
-                "notes": notes,
-                "asset_name": chosen["name"] if chosen else "",
-                "asset_url": chosen["url"] if chosen else "",
-                "asset_size": int(chosen["size"]) if chosen else 0,
-            }
-
-            self._log_update_check(f"OK tag={info['version']} asset={info['asset_name'] or '(none)'}")
-            return info if info["version"] else None
-
-        except urllib.error.HTTPError as e:
-            try:
-                body = e.read().decode("utf-8", errors="replace")
-            except Exception:
-                body = ""
-            self._log_update_check(f"HTTPError {e.code}: {body[:900]}")
-            self._last_update_error = f"GitHub returned HTTP {e.code}."
-            return None
-        except urllib.error.URLError as e:
-            self._log_update_check(f"URLError: {e}")
-            self._last_update_error = f"Network error: {e}"
-            return None
-        except Exception as e:
-            self._log_update_check(f"Exception: {repr(e)}")
-            self._last_update_error = f"Unexpected error: {repr(e)}"
-            return None
-
     def _check_updates_async(self, prompt_if_new: bool = True):
         def worker():
-            info = self._fetch_latest_release_info()
-            def ui():
-                if info is None:
-                    msg = self._last_update_error or "Could not check for updates."
-                    messagebox.showwarning(APP_NAME, f"{msg}\n\nLog: {self.data_dir / 'update_check.log'}")
+            try:
+                self._log_check(f"Check start (installed=v{APP_VERSION})")
+                info = get_latest_release_info()
+                if not info:
+                    self._log_check("Check failed: no response")
+                    self.after(0, lambda: messagebox.showwarning(APP_NAME, "Could not check for updates."))
                     self.status_var.set(f"Update check failed — {now_ts()}")
                     return
 
-                latest = str(info.get("version", "")).strip()
-                if not latest:
-                    messagebox.showwarning(APP_NAME, "No version found on latest release.")
-                    return
+                latest = str(info.get("version") or "").strip()
+                html_url = str(info.get("html_url") or GITHUB_RELEASES_PAGE).strip()
+                asset_url = str(info.get("asset_url") or "").strip()
+                asset_name = str(info.get("asset_name") or "").strip()
 
-                if not is_newer(latest, APP_VERSION):
-                    if prompt_if_new:
-                        messagebox.showinfo(APP_NAME, f"You are up to date.\n\nInstalled: {APP_VERSION}\nLatest: {latest}")
-                    self.status_var.set(f"Up to date — {now_ts()}")
+                self._log_check(f"Latest={latest} asset={asset_name} url={asset_url}")
+
+                if not latest or not is_newer_version(latest, f"v{APP_VERSION}"):
+                    self.status_var.set(f"No updates available — {now_ts()}")
                     return
 
                 if not prompt_if_new:
-                    # Still prompt on startup per your requirement
-                    pass
+                    self.status_var.set(f"Update available: {latest} — {now_ts()}")
+                    return
 
-                asset_url = str(info.get("asset_url", "")).strip()
-                html_url = str(info.get("html_url", "")).strip()
-
-                if not asset_url:
-                    resp = messagebox.askyesno(
-                        APP_NAME,
-                        f"Update available.\n\nInstalled: {APP_VERSION}\nLatest: {latest}\n\n"
-                        "No downloadable ZIP/EXE asset was found on the latest release.\n"
-                        "This usually means the release asset was not uploaded under Assets.\n\n"
-                        "Open the release page?"
+                def ui_prompt():
+                    msg = (
+                        "Update available.\n\n"
+                        f"Installed: {APP_VERSION}\n"
+                        f"Latest: {latest}\n\n"
                     )
-                    if resp and html_url:
-                        webbrowser.open(html_url)
-                    return
 
-                resp = messagebox.askyesno(
-                    APP_NAME,
-                    f"Update available.\n\nInstalled: {APP_VERSION}\nLatest: {latest}\n\n"
-                    "Would you like to download and install it now?\n"
-                    "The app will restart."
-                )
-                if not resp:
-                    self.status_var.set(f"Update skipped ({latest}) — {now_ts()}")
-                    return
+                    if not asset_url:
+                        msg += "No ZIP/EXE asset URL was found on the latest release.\nOpen the release page?"
+                        yes = messagebox.askyesno(APP_NAME, msg)
+                        if yes:
+                            webbrowser.open(html_url)
+                        return
 
-                self._download_and_apply_update_async(info)
+                    msg += "Do you want to download and install the update now?\n\nYes = Auto-update\nNo = Cancel"
+                    yes = messagebox.askyesno(APP_NAME, msg)
+                    if yes:
+                        self._download_and_apply_update_async(
+                            {"version": latest, "asset_url": asset_url, "asset_name": asset_name, "html_url": html_url}
+                        )
+                    else:
+                        self.status_var.set(f"Update skipped ({latest}) — {now_ts()}")
 
-            self.after(0, ui)
+                self.after(0, ui_prompt)
+
+            except Exception as e:
+                self._log_check(f"ERROR: {repr(e)}")
+                self.after(0, lambda: messagebox.showwarning(APP_NAME, "Could not check for updates."))
+                self.status_var.set(f"Update check failed — {now_ts()}")
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _download_and_apply_update_async(self, info: dict):
         """
         Robust updater:
-        - download asset (ZIP preferred; EXE supported)
-        - validate (size if provided; signature)
-        - extract if ZIP; locate Copy2.exe
-        - stage into temp workdir
-        - run updater .bat (backup + swap + rollback if new exe fails to start)
+        - Only auto-updates if frozen AND onefile build.
+        - Downloads asset to a temp workdir
+        - Stages Copy2.exe from zip (or direct exe)
+        - Writes a BAT that:
+            wait -> backup -> copy new -> env reset -> selftest retries -> rollback if needed
+        - Starts BAT, then closes this instance.
         """
-        asset_url = str(info.get("asset_url", "")).strip()
-        latest = str(info.get("version", "")).strip()
-        html_url = str(info.get("html_url", "")).strip()
-        expected_size = int(info.get("asset_size", 0) or 0)
-
-        if not asset_url or not latest:
-            messagebox.showwarning(APP_NAME, "Missing update download information.")
-            return
-
-        if not self._is_frozen():
-            messagebox.showinfo(
-                APP_NAME,
-                "Auto-update is supported for the packaged portable .exe.\n\n"
-                "You are running a Python script environment; opening the release page instead."
-            )
-            if html_url:
-                webbrowser.open(html_url)
-            return
-
-        target_exe = Path(sys.executable)
-        target_dir = target_exe.parent
-
-        if not target_exe.exists():
-            messagebox.showerror(APP_NAME, "Could not locate the current executable for updating.")
-            return
-
         def worker():
+            asset_url = str(info.get("asset_url", "")).strip()
+            latest = str(info.get("version", "")).strip()
+            html_url = str(info.get("html_url", "")).strip()
+            asset_name = str(info.get("asset_name", "")).strip()
+
             try:
-                self._log_update_install(f"Update start -> latest={latest} url={asset_url}")
-                self._log_update_install(f"Target exe: {target_exe}")
+                self._log_install(f"Update start -> latest={latest} url={asset_url}")
+
+                if not is_frozen():
+                    messagebox.showinfo(
+                        APP_NAME,
+                        "Auto-update is supported for the packaged portable .exe.\n\n"
+                        "You are running a Python script environment; opening the release page instead.",
+                    )
+                    if html_url:
+                        webbrowser.open(html_url)
+                    return
+
+                target_exe = Path(sys.executable)
+                target_dir = target_exe.parent
+
+                # Block onedir updates when release only ships EXE/ZIP without full folder payload
+                if is_onedir_frozen(target_exe):
+                    messagebox.showinfo(
+                        APP_NAME,
+                        "You appear to be running an ONEDIR build (folder-based).\n\n"
+                        "Auto-update requires a ONEFILE build, or you must publish a full folder payload.\n"
+                        "Opening the release page instead.",
+                    )
+                    if html_url:
+                        webbrowser.open(html_url)
+                    return
+
+                if not target_exe.exists():
+                    messagebox.showerror(APP_NAME, "Could not locate the current executable for updating.")
+                    return
+
+                self._log_install(f"Target exe: {target_exe}")
 
                 workdir = Path(tempfile.mkdtemp(prefix="copy2_update_"))
-                self._log_update_install(f"Workdir: {workdir}")
+                self._log_install(f"Workdir: {workdir}")
 
-                # Download bytes
-                req = urllib.request.Request(
-                    asset_url,
-                    headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"},
-                    method="GET",
-                )
-                with urllib.request.urlopen(req, timeout=40) as r:
-                    data = r.read()
+                download_path = workdir / (asset_name or "Copy2_update.bin")
 
-                dl_path = workdir / "download.bin"
-                dl_path.write_bytes(data)
-                got_size = dl_path.stat().st_size
-                self._log_update_install(f"Downloaded bytes: {got_size} expected={expected_size}")
+                downloaded, expected = _http_download(asset_url, download_path, timeout=60)
+                self._log_install(f"Downloaded bytes: {downloaded} expected={expected}")
 
-                if expected_size > 0 and got_size != expected_size:
-                    raise RuntimeError(f"Download size mismatch (got {got_size}, expected {expected_size}).")
+                if expected is not None and downloaded != expected:
+                    raise RuntimeError("Download size mismatch (possible partial download).")
 
-                # Decide if ZIP or EXE
-                head4 = data[:4]
-                is_zip = (head4 == b"PK\x03\x04")
-                is_exe = (data[:2] == b"MZ")
+                # Stage new exe
+                staged_copy2 = workdir / "staged_Copy2.exe"
+                staged_uninst = workdir / "staged_Copy2_Uninstall.exe"  # optional (may not exist)
 
-                staged_copy2 = workdir / "Copy2_new.exe"
-                staged_uninst = workdir / "Copy2_Uninstall_new.exe"
-                # If no uninstaller shipped, we'll leave staged_uninst missing/empty and batch will skip
-
-                if is_zip:
-                    zip_path = workdir / "update.zip"
-                    shutil.move(str(dl_path), str(zip_path))
-
-                    # Extract
-                    extract_dir = workdir / "unzipped"
-                    extract_dir.mkdir(parents=True, exist_ok=True)
-                    with zipfile.ZipFile(zip_path, "r") as z:
-                        z.extractall(extract_dir)
-
-                    # Find Copy2.exe
-                    new_copy2 = None
-                    for p in extract_dir.rglob("Copy2.exe"):
-                        new_copy2 = p
-                        break
-
-                    if new_copy2 is None:
-                        # fallback: largest exe
-                        exes = list(extract_dir.rglob("*.exe"))
-                        if exes:
-                            new_copy2 = sorted(exes, key=lambda x: x.stat().st_size, reverse=True)[0]
-
-                    if new_copy2 is None or not new_copy2.exists():
-                        raise RuntimeError("Could not locate Copy2.exe inside the update ZIP.")
-
-                    if new_copy2.stat().st_size < MIN_EXE_BYTES:
-                        raise RuntimeError("Extracted Copy2.exe is unexpectedly small; update package likely corrupt.")
-
-                    shutil.copy2(new_copy2, staged_copy2)
-                    self._log_update_install(f"Staged exe from zip: {new_copy2} size={new_copy2.stat().st_size}")
-
-                    # Optional uninstaller (only if present)
-                    found_uninst = None
-                    for p in extract_dir.rglob("Copy2_Uninstall.exe"):
-                        found_uninst = p
-                        break
-                    if found_uninst and found_uninst.exists():
-                        shutil.copy2(found_uninst, staged_uninst)
-                        self._log_update_install(f"Staged uninstaller: {found_uninst} size={found_uninst.stat().st_size}")
-                    else:
-                        # ensure not present
-                        try:
-                            if staged_uninst.exists():
-                                staged_uninst.unlink()
-                        except Exception:
-                            pass
-
-                elif is_exe:
-                    # Direct exe asset
-                    if got_size < MIN_EXE_BYTES:
-                        raise RuntimeError("Downloaded EXE is unexpectedly small; update likely corrupt.")
-                    shutil.move(str(dl_path), str(staged_copy2))
-                    self._log_update_install(f"Staged exe direct: {staged_copy2} size={staged_copy2.stat().st_size}")
-                    # No uninstaller
-                    try:
-                        if staged_uninst.exists():
-                            staged_uninst.unlink()
-                    except Exception:
-                        pass
+                if str(download_path).lower().endswith(".exe"):
+                    # direct exe
+                    staged_copy2.write_bytes(download_path.read_bytes())
+                    self._log_install(f"Staged exe direct: {staged_copy2} size={staged_copy2.stat().st_size}")
 
                 else:
-                    # Probably HTML/error page saved
-                    preview = dl_path.read_text(encoding="utf-8", errors="ignore")[:240]
-                    self._log_update_install(f"Signature mismatch. First chars:\n{preview}")
-                    raise RuntimeError("Downloaded file is not a ZIP or EXE. (Possible GitHub HTML/error response.)")
+                    # zip path
+                    if not zipfile.is_zipfile(download_path):
+                        # sometimes GitHub returns HTML if blocked/rate limited
+                        preview = download_path.read_bytes()[:200].decode("utf-8", errors="ignore")
+                        self._log_install(f"Downloaded file not a zip. First bytes: {preview!r}")
+                        raise RuntimeError("Downloaded file is not a ZIP (possible HTML/error response).")
 
-                # Build updater batch (backup + swap + rollback)
+                    unzip_dir = workdir / "unzipped"
+                    unzip_dir.mkdir(parents=True, exist_ok=True)
+
+                    with zipfile.ZipFile(download_path, "r") as z:
+                        z.extractall(unzip_dir)
+
+                    # Find Copy2.exe in extracted structure
+                    candidates = list(unzip_dir.rglob("Copy2.exe"))
+                    if not candidates:
+                        # also accept renamed exe if user changed it
+                        exes = list(unzip_dir.rglob("*.exe"))
+                        raise RuntimeError(
+                            f"No Copy2.exe was found inside the ZIP.\nFound EXEs: {[x.name for x in exes][:15]}"
+                        )
+
+                    # Prefer the first matching "Copy2.exe"
+                    src = candidates[0]
+                    staged_copy2.write_bytes(src.read_bytes())
+                    self._log_install(f"Staged exe from zip: {src} -> {staged_copy2} size={staged_copy2.stat().st_size}")
+
+                    # Optional uninstaller if present in zip
+                    un_candidates = list(unzip_dir.rglob("Copy2_Uninstall.exe"))
+                    if un_candidates:
+                        staged_uninst.write_bytes(un_candidates[0].read_bytes())
+                        self._log_install(f"Staged uninstall: {un_candidates[0]} -> {staged_uninst}")
+
+                # Write BAT with env reset + selftest + retries + rollback
                 pid = os.getpid()
                 exe_name = target_exe.name
                 bak_exe = target_dir / (exe_name + ".bak")
                 bat = workdir / "copy2_updater.bat"
 
-                bat_contents = f"""@echo off
-setlocal enabledelayedexpansion
+                batlog = self.data_dir / "update_bat.log"
 
-set PID={pid}
-set TARGET_EXE="{str(target_exe)}"
-set TARGET_DIR="{str(target_dir)}"
-set EXE_NAME={exe_name}
-set BAK_EXE="{str(bak_exe)}"
-set NEW_COPY2="{str(staged_copy2)}"
-set NEW_UNINST="{str(staged_uninst)}"
+                bat_contents = f"""@echo off
+setlocal enableextensions enabledelayedexpansion
+
+set "PID={pid}"
+set "TARGET_EXE={str(target_exe)}"
+set "TARGET_DIR={str(target_dir)}"
+set "EXE_NAME={exe_name}"
+set "BAK_EXE={str(bak_exe)}"
+set "NEW_COPY2={str(staged_copy2)}"
+set "NEW_UNINST={str(staged_uninst)}"
+set "BATLOG={str(batlog)}"
+
+echo {now_ts()}  BAT start>> "%BATLOG%"
+echo PID=%PID%>> "%BATLOG%"
+echo TARGET_EXE=%TARGET_EXE%>> "%BATLOG%"
+echo TARGET_DIR=%TARGET_DIR%>> "%BATLOG%"
+echo NEW_COPY2=%NEW_COPY2%>> "%BATLOG%"
 
 :wait
 for /f "tokens=2 delims=," %%A in ('tasklist /FI "PID eq %PID%" /FO CSV /NH 2^>NUL') do (
@@ -1416,38 +1429,79 @@ for /f "tokens=2 delims=," %%A in ('tasklist /FI "PID eq %PID%" /FO CSV /NH 2^>N
   )
 )
 
-REM Backup current exe
-if exist %BAK_EXE% del /f /q %BAK_EXE% >NUL 2>&1
-copy /y %TARGET_EXE% %BAK_EXE% >NUL 2>&1
+pushd "%TARGET_DIR%" >NUL 2>&1
+if errorlevel 1 (
+  echo {now_ts()}  pushd failed>> "%BATLOG%"
+  exit /b 1
+)
 
-REM Swap in new exe
-move /y %NEW_COPY2% %TARGET_EXE% >NUL 2>&1
+REM Backup current exe
+if exist "%BAK_EXE%" del /f /q "%BAK_EXE%" >NUL 2>&1
+copy /y "%TARGET_EXE%" "%BAK_EXE%" >NUL 2>&1
+if errorlevel 1 (
+  echo {now_ts()}  backup failed>> "%BATLOG%"
+  popd
+  exit /b 1
+)
+
+REM Swap in new exe (copy, do not move)
+copy /y "%NEW_COPY2%" "%TARGET_EXE%" >NUL 2>&1
+if errorlevel 1 (
+  echo {now_ts()}  swap failed>> "%BATLOG%"
+  if exist "%BAK_EXE%" copy /y "%BAK_EXE%" "%TARGET_EXE%" >NUL 2>&1
+  popd
+  exit /b 1
+)
 
 REM Optional uninstaller swap if provided
-if exist %NEW_UNINST% (
-  for %%I in (%NEW_UNINST%) do set SIZE=%%~zI
+if exist "%NEW_UNINST%" (
+  for %%I in ("%NEW_UNINST%") do set SIZE=%%~zI
   if NOT "!SIZE!"=="0" (
-    move /y %NEW_UNINST% %TARGET_DIR%\\Copy2_Uninstall.exe >NUL 2>&1
+    copy /y "%NEW_UNINST%" "%TARGET_DIR%\\Copy2_Uninstall.exe" >NUL 2>&1
   )
 )
 
-REM Start updated app
-start "" /d %TARGET_DIR% %TARGET_EXE%
 timeout /t 2 /nobreak >NUL
 
-REM If it didn't start, rollback
-tasklist /FI "IMAGENAME eq %EXE_NAME%" /NH | find /I "%EXE_NAME%" >NUL
+REM Critical: clear PyInstaller/Python env vars
+set "PYTHONHOME="
+set "PYTHONPATH="
+set "_MEIPASS2="
+set "PYINSTALLER_RESET_ENVIRONMENT=1"
+
+set "TRIES=0"
+:selftest
+set /a TRIES+=1
+echo {now_ts()}  selftest try !TRIES!>> "%BATLOG%"
+
+"%TARGET_EXE%" --copy2-selftest >NUL 2>&1
 if errorlevel 1 (
-  copy /y %BAK_EXE% %TARGET_EXE% >NUL 2>&1
-  start "" /d %TARGET_DIR% %TARGET_EXE%
+  echo {now_ts()}  selftest failed try !TRIES!>> "%BATLOG%"
+  if !TRIES! LSS 5 (
+    timeout /t 2 /nobreak >NUL
+    goto selftest
+  )
+
+  echo {now_ts()}  selftest failed - rollback>> "%BATLOG%"
+  if exist "%BAK_EXE%" copy /y "%BAK_EXE%" "%TARGET_EXE%" >NUL 2>&1
+  start "" "%TARGET_EXE%"
+  popd
+  exit /b 1
 )
 
-del "%~f0"
+echo {now_ts()}  selftest OK - launching>> "%BATLOG%"
+start "" "%TARGET_EXE%"
+
+popd
+echo {now_ts()}  BAT done>> "%BATLOG%"
+del "%~f0" >NUL 2>&1
 endlocal
 """
-                bat.write_text(bat_contents, encoding="utf-8", errors="ignore")
-                self._log_update_install(f"Wrote updater bat: {bat}")
 
+                bat.write_text(bat_contents, encoding="utf-8", errors="ignore")
+                self._log_install(f"Wrote updater bat: {bat}")
+
+                # Launch bat detached
                 creationflags = 0
                 if hasattr(subprocess, "DETACHED_PROCESS"):
                     creationflags |= subprocess.DETACHED_PROCESS
@@ -1461,23 +1515,26 @@ endlocal
                     cwd=str(workdir),
                 )
 
-                # Close this instance
-                self.after(0, lambda: self._on_close_for_update())
+                self.status_var.set(f"Applying update and restarting... — {now_ts()}")
+                self.after(150, self._on_close_for_update)
+                return
 
             except Exception as e:
-                self._log_update_install(f"ERROR: {repr(e)}")
+                self._log_install(f"ERROR: {repr(e)}")
+
                 def ui_err():
                     messagebox.showerror(
                         APP_NAME,
-                        f"Update failed:\n{e}\n\nLog:\n{self.data_dir / 'update_install.log'}"
+                        f"Update failed:\n{e}\n\nLog:\n{self.data_dir / 'update_install.log'}",
                     )
                     self.status_var.set(f"Update failed — {now_ts()}")
+
                 self.after(0, ui_err)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_close_for_update(self):
-        # Like normal close, but no “unsaved edits” blocking
+        # Close without unsaved edits blocking (updater already staged)
         try:
             if self._poll_job is not None:
                 self.after_cancel(self._poll_job)
@@ -1513,14 +1570,12 @@ if USE_TTKB:
             self._build_context_menu()
             self._refresh_list(select_last=True)
 
-            # Start clipboard polling
             self.after(250, self._poll_clipboard)
-
-            # Update check on startup
-            if CHECK_UPDATES_ON_STARTUP:
-                self.after(STARTUP_UPDATE_DELAY_MS, lambda: self._check_updates_async(prompt_if_new=True))
-
             self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+            # Auto-check updates on launch (non-blocking)
+            if self.settings.check_updates_on_launch:
+                self.after(900, lambda: self._check_updates_async(prompt_if_new=True))
 
         def _apply_window_defaults(self):
             self.minsize(1100, 720)
@@ -1528,20 +1583,6 @@ if USE_TTKB:
                 self.tk.call("tk", "scaling", 1.2)
             except Exception:
                 pass
-
-        def _tooltip(self, widget, text: str):
-            if not text:
-                return
-            try:
-                if TBToolTip:
-                    TBToolTip(widget, text=text)
-                else:
-                    SimpleTooltip(widget, text)
-            except Exception:
-                try:
-                    SimpleTooltip(widget, text)
-                except Exception:
-                    pass
 
         def _build_ui(self):
             root = tb.Frame(self, padding=12)
@@ -1568,13 +1609,15 @@ if USE_TTKB:
 
             btn_find = tb.Button(search_box, text="Find", command=self._search, bootstyle=PRIMARY)
             btn_find.pack(side=LEFT, padx=(10, 0))
-            self._tooltip(btn_find, "Find (Enter)")
+            ToolTip(btn_find, "Find (Enter)")
 
             btn_prev = tb.Button(search_box, text="Prev", command=lambda: self._jump_match(-1), bootstyle=SECONDARY)
             btn_prev.pack(side=LEFT, padx=(8, 0))
+
             btn_next = tb.Button(search_box, text="Next", command=lambda: self._jump_match(1), bootstyle=SECONDARY)
             btn_next.pack(side=LEFT, padx=(8, 0))
 
+            # Spacer to ensure Pause isn't too close
             tb.Frame(top, width=18).pack(side=LEFT)
 
             # Right actions
@@ -1590,23 +1633,23 @@ if USE_TTKB:
                 bootstyle="round-toggle",
             )
             pause_btn.pack(side=LEFT, padx=(10, 18))
-            self._tooltip(pause_btn, "Pause/Resume capturing")
+            ToolTip(pause_btn, "Pause capturing")
 
-            upd_btn = tb.Button(action_box, text="Check Updates", command=lambda: self._check_updates_async(prompt_if_new=True), bootstyle=OUTLINE)
-            upd_btn.pack(side=LEFT, padx=(0, 8))
-            self._tooltip(upd_btn, "Check for updates (GitHub Releases)")
+            btn_updates = tb.Button(action_box, text="Check Updates", command=lambda: self._check_updates_async(True), bootstyle=INFO)
+            btn_updates.pack(side=LEFT, padx=(0, 8))
+            ToolTip(btn_updates, "Check for updates now")
 
-            exp_btn = tb.Button(action_box, text="Export", command=self._export, bootstyle=OUTLINE)
-            exp_btn.pack(side=LEFT, padx=(0, 8))
-            self._tooltip(exp_btn, "Export (Ctrl+E)")
+            btn_export = tb.Button(action_box, text="Export", command=self._export, bootstyle=OUTLINE)
+            btn_export.pack(side=LEFT, padx=(0, 8))
+            ToolTip(btn_export, "Export (Ctrl+E)")
 
-            imp_btn = tb.Button(action_box, text="Import", command=self._import, bootstyle=OUTLINE)
-            imp_btn.pack(side=LEFT, padx=(0, 8))
-            self._tooltip(imp_btn, "Import (Ctrl+I)")
+            btn_import = tb.Button(action_box, text="Import", command=self._import, bootstyle=OUTLINE)
+            btn_import.pack(side=LEFT, padx=(0, 8))
+            ToolTip(btn_import, "Import (Ctrl+I)")
 
-            set_btn = tb.Button(action_box, text="Settings", command=self._open_settings, bootstyle=SECONDARY)
-            set_btn.pack(side=LEFT)
-            self._tooltip(set_btn, "Settings / Controls")
+            btn_settings = tb.Button(action_box, text="Settings", command=self._open_settings, bootstyle=SECONDARY)
+            btn_settings.pack(side=LEFT)
+            ToolTip(btn_settings, "Settings (includes hotkeys list)")
 
             tb.Separator(root).pack(fill=X, pady=(0, 10))
 
@@ -1617,7 +1660,7 @@ if USE_TTKB:
             body.columnconfigure(1, weight=2)
             body.rowconfigure(0, weight=1)
 
-            # Left pane
+            # Left pane (History)
             left = tb.Labelframe(body, text="History", padding=10)
             left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
             left.rowconfigure(2, weight=1)
@@ -1631,9 +1674,9 @@ if USE_TTKB:
             tb.Radiobutton(filters, text="All", value="all", variable=self.filter_var, command=self._refresh_list, bootstyle="toolbutton").grid(row=0, column=0, padx=(0, 8))
             tb.Radiobutton(filters, text="Favorites", value="fav", variable=self.filter_var, command=self._refresh_list, bootstyle="toolbutton").grid(row=0, column=1, padx=(0, 8))
 
-            clean_btn = tb.Button(filters, text="Clean", command=self._clean_history, bootstyle=DANGER)
-            clean_btn.grid(row=0, column=4, sticky="e")
-            self._tooltip(clean_btn, "Clean non-favorites (Ctrl+L)")
+            btn_clean = tb.Button(filters, text="Clean", command=self._clean_keep_favorites, bootstyle=DANGER)
+            btn_clean.grid(row=0, column=4, sticky="e")
+            ToolTip(btn_clean, "Clean (keeps favorites)  (Ctrl+L)")
 
             self.listbox = tk.Listbox(left, activestyle="dotbox", exportselection=False, selectmode=tk.EXTENDED)
             self.listbox.grid(row=2, column=0, sticky="nsew")
@@ -1649,22 +1692,21 @@ if USE_TTKB:
             for i in range(4):
                 left_actions.columnconfigure(i, weight=1)
 
-            b_copy = tb.Button(left_actions, text="Copy", command=self._copy_selected, bootstyle=SUCCESS)
-            b_copy.grid(row=0, column=0, sticky="ew", padx=(0, 8))
-            self._tooltip(b_copy, "Copy (Ctrl+C)")
+            btn_copy = tb.Button(left_actions, text="Copy", command=self._copy_selected, bootstyle=SUCCESS)
+            btn_copy.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+            ToolTip(btn_copy, "Copy Preview (Ctrl+C)")
 
-            b_del = tb.Button(left_actions, text="Delete", command=self._delete_selected, bootstyle=WARNING)
-            b_del.grid(row=0, column=1, sticky="ew", padx=(0, 8))
-            self._tooltip(b_del, "Delete (Del)")
+            btn_del = tb.Button(left_actions, text="Delete", command=self._delete_selected, bootstyle=WARNING)
+            btn_del.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+            ToolTip(btn_del, "Delete (Del)")
 
-            b_fav = tb.Button(left_actions, text="Fav / Unfav", command=self._toggle_favorite_selected, bootstyle=INFO)
-            b_fav.grid(row=0, column=2, sticky="ew", padx=(0, 8))
+            btn_fav = tb.Button(left_actions, text="Fav / Unfav", command=self._toggle_favorite_selected, bootstyle=INFO)
+            btn_fav.grid(row=0, column=2, sticky="ew", padx=(0, 8))
 
-            b_comb = tb.Button(left_actions, text="Combine", command=self._combine_selected, bootstyle=PRIMARY)
-            b_comb.grid(row=0, column=3, sticky="ew")
-            self._tooltip(b_comb, "Combine selected (Ctrl+Click multi-select)")
+            btn_combine = tb.Button(left_actions, text="Combine", command=self._combine_selected, bootstyle=PRIMARY)
+            btn_combine.grid(row=0, column=3, sticky="ew")
 
-            # Right pane
+            # Right pane (Preview)
             right = tb.Labelframe(body, text="Preview (Editable)", padding=10)
             right.grid(row=0, column=1, sticky="nsew")
             right.rowconfigure(1, weight=1)
@@ -1675,30 +1717,30 @@ if USE_TTKB:
             preview_actions.columnconfigure(0, weight=1)
 
             self.reverse_var = tk.BooleanVar(value=self.settings.reverse_lines_copy)
-            rev_toggle = tb.Checkbutton(
+            rev_btn = tb.Checkbutton(
                 preview_actions,
                 text="Reverse-lines copy",
                 variable=self.reverse_var,
                 command=self._toggle_reverse_lines,
                 bootstyle="round-toggle",
             )
-            rev_toggle.pack(side=LEFT)
-            self._tooltip(rev_toggle, "Reverse lines (preview shows what will be copied)")
+            rev_btn.pack(side=LEFT)
+            ToolTip(rev_btn, "Reverse lines in Preview and Copy")
 
             self.preview_dirty_var = tk.StringVar(value="")
             tb.Label(preview_actions, textvariable=self.preview_dirty_var).pack(side=LEFT, padx=(10, 0))
 
             self.revert_btn = tb.Button(preview_actions, text="Revert", command=self._revert_preview_edits, bootstyle=WARNING)
             self.revert_btn.pack(side=RIGHT, padx=(0, 8))
-            self._tooltip(self.revert_btn, "Revert (Esc)")
+            ToolTip(self.revert_btn, "Revert (Esc)")
 
             self.save_btn = tb.Button(preview_actions, text="Save Edit", command=self._save_preview_edits, bootstyle=SUCCESS)
             self.save_btn.pack(side=RIGHT, padx=(0, 8))
-            self._tooltip(self.save_btn, "Save (Ctrl+S)")
+            ToolTip(self.save_btn, "Save (Ctrl+S)")
 
-            copy_prev = tb.Button(preview_actions, text="Copy Preview", command=self._copy_selected, bootstyle=SUCCESS)
-            copy_prev.pack(side=RIGHT)
-            self._tooltip(copy_prev, "Copy Preview (Ctrl+C)")
+            btn_copy_prev = tb.Button(preview_actions, text="Copy Preview", command=self._copy_selected, bootstyle=SUCCESS)
+            btn_copy_prev.pack(side=RIGHT)
+            ToolTip(btn_copy_prev, "Copy (Ctrl+C)")
 
             self.preview = tk.Text(right, wrap="word", undo=True)
             self.preview.grid(row=1, column=0, sticky="nsew")
@@ -1708,9 +1750,10 @@ if USE_TTKB:
             sb2.grid(row=1, column=1, sticky="ns")
             self.preview.configure(yscrollcommand=sb2.set)
 
+            # Bottom status bar
             bottom = tb.Frame(root)
             bottom.pack(fill=X, pady=(10, 0))
-            self.status_var = tk.StringVar(value=f"Items: {len(self.history)}   Favorites: {len(self.favorites)}   Data: {self.data_dir}")
+            self.status_var = tk.StringVar(value=f"v{APP_VERSION}   Items: {len(self.history)}   Favorites: {len(self.favorites)}   Data: {self.data_dir}")
             tb.Label(bottom, textvariable=self.status_var).pack(side=LEFT)
 
             self._update_preview_dirty_ui()
@@ -1722,7 +1765,7 @@ if USE_TTKB:
             self.bind("<Delete>", lambda e: (self._delete_selected(), "break"))
             self.bind("<Control-e>", lambda e: (self._export(), "break"))
             self.bind("<Control-i>", lambda e: (self._import(), "break"))
-            self.bind("<Control-l>", lambda e: (self._clean_history(), "break"))
+            self.bind("<Control-l>", lambda e: (self._clean_keep_favorites(), "break"))
             self.bind("<Control-s>", lambda e: (self._save_preview_edits(), "break"))
             self.bind("<Escape>", lambda e: (self._revert_preview_edits(), "break"))
 
@@ -1749,7 +1792,7 @@ if USE_TTKB:
 
 
 else:
-    # Minimal ttk fallback
+    # ttk fallback (minimal; modern UI requires ttkbootstrap)
     class Copy2App(tk.Tk, Copy2AppBase):
         def __init__(self):
             super().__init__()
@@ -1763,9 +1806,10 @@ else:
             self._refresh_list(select_last=True)
 
             self.after(250, self._poll_clipboard)
-            if CHECK_UPDATES_ON_STARTUP:
-                self.after(STARTUP_UPDATE_DELAY_MS, lambda: self._check_updates_async(prompt_if_new=True))
             self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+            if self.settings.check_updates_on_launch:
+                self.after(900, lambda: self._check_updates_async(prompt_if_new=True))
 
         def _build_ui(self):
             from tkinter import ttk
@@ -1794,6 +1838,7 @@ else:
         def _bind_shortcuts(self):
             self.bind("<Control-s>", lambda e: (self._save_preview_edits(), "break"))
             self.bind("<Escape>", lambda e: (self._revert_preview_edits(), "break"))
+            self.bind("<Control-l>", lambda e: (self._clean_keep_favorites(), "break"))
 
         def _on_close(self):
             try:
@@ -1806,6 +1851,10 @@ else:
 
 
 def main():
+    # Selftest for updater BAT: if this runs, Python DLLs loaded successfully.
+    if "--copy2-selftest" in sys.argv:
+        sys.exit(0)
+
     app = Copy2App() if not USE_TTKB else Copy2App()
     app.mainloop()
 
