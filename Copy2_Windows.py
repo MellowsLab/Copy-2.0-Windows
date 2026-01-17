@@ -40,6 +40,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import difflib
+import ctypes
 import sys
 import time
 import zipfile
@@ -91,7 +93,7 @@ APP_ID = "copy2"
 VENDOR = "MellowsLab"
 
 # App version (display + update compare)
-APP_VERSION = "1.0.4"  # <-- keep this in sync with your build/tag
+APP_VERSION = "1.0.5"  # <-- keep this in sync with your build/tag
 
 DEFAULT_MAX_HISTORY = 50
 DEFAULT_POLL_MS = 400
@@ -388,6 +390,9 @@ class Copy2AppBase:
         self.history_path = self.data_dir / "history.json"
         self.favs_path = self.data_dir / "favorites.json"
 
+        self.meta_path = self.data_dir / "meta.json"
+        self.snippets_path = self.data_dir / "snippets.json"
+
         self.log_update_check = self.data_dir / "update_check.log"
         self.log_update_install = self.data_dir / "update_install.log"
 
@@ -414,6 +419,25 @@ class Copy2AppBase:
             hist = []
 
         self.history = deque(hist, maxlen=self.settings.max_history)
+
+        # Metadata (best-effort source tracking)
+        meta = safe_json_load(self.meta_path, {})
+        self.meta: dict[str, dict] = meta if isinstance(meta, dict) else {}
+
+        # Snippets / templates
+        snips = safe_json_load(self.snippets_path, [])
+        if isinstance(snips, list):
+            snips = [x for x in snips if isinstance(x, dict)]
+        else:
+            snips = []
+        self.snippets: list[dict] = snips
+
+        # Search options
+        self.fuzzy_search_enabled = False
+
+        # Preview match navigation (within Preview)
+        self._preview_match_spans: list[tuple[int, int]] = []
+        self._preview_match_i: int = 0
 
         self.paused = False
         self.last_clip = ""
@@ -453,6 +477,8 @@ class Copy2AppBase:
             "Save Preview Edit": "Ctrl+S",
             "Revert Preview Edit": "Esc",
             "Check Updates": "(Button)",
+            "Snippets": "(Button)",
+            "Format Tools": "(Button)",
         }
 
         # Ensure favorites remain present in history (optional)
@@ -477,11 +503,13 @@ class Copy2AppBase:
             pass
 
     def _persist(self):
-        if self.settings.session_only:
-            return
+        # Session-only means: do not persist *history*. Other settings should still persist.
         safe_json_save(self.settings_path, asdict(self.settings))
-        safe_json_save(self.history_path, list(self.history))
         safe_json_save(self.favs_path, list(self.favorites))
+        safe_json_save(self.meta_path, self.meta)
+        safe_json_save(self.snippets_path, self.snippets)
+        if not self.settings.session_only:
+            safe_json_save(self.history_path, list(self.history))
 
     # -----------------------------
     # Favorites & capacity management
@@ -492,6 +520,129 @@ class Copy2AppBase:
         (it may have been manually removed). This function is left as a hook if you want that behavior.
         """
         return
+
+    # -----------------------------
+    # Metadata & template helpers
+    # -----------------------------
+    def _get_active_window_info(self) -> tuple[str, str]:
+        """Best-effort active window process name + window title (Windows only)."""
+        try:
+            if os.name != "nt":
+                return ("", "")
+
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+
+            hwnd = user32.GetForegroundWindow()
+            if not hwnd:
+                return ("", "")
+
+            # Window title
+            length = user32.GetWindowTextLengthW(hwnd)
+            title = ""
+            if length > 0:
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buf, length + 1)
+                title = buf.value or ""
+
+            # PID
+            pid = ctypes.c_ulong(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            pid_val = int(pid.value)
+            if pid_val <= 0:
+                return ("", title)
+
+            # Process name (QueryFullProcessImageNameW)
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            hproc = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid_val)
+            if not hproc:
+                return ("", title)
+            try:
+                size = ctypes.c_ulong(260)
+                bufp = ctypes.create_unicode_buffer(260)
+                if kernel32.QueryFullProcessImageNameW(hproc, 0, bufp, ctypes.byref(size)):
+                    path = bufp.value
+                    exe = os.path.basename(path)
+                    return (exe, title)
+            finally:
+                kernel32.CloseHandle(hproc)
+
+            return ("", title)
+        except Exception:
+            return ("", "")
+
+    def _touch_meta(self, text: str, is_new: bool) -> None:
+        if not text:
+            return
+        info = self.meta.get(text) if isinstance(self.meta, dict) else None
+        if not isinstance(info, dict):
+            info = {}
+
+        app, title = self._get_active_window_info()
+        ts = now_ts()
+
+        if is_new and not info.get("created_at"):
+            info["created_at"] = ts
+
+        info["updated_at"] = ts
+        info["copy_count"] = int(info.get("copy_count", 0)) + 1
+        if app:
+            info["source_app"] = app
+        if title:
+            info["window_title"] = title
+
+        self.meta[text] = info
+
+    def _move_meta_key(self, old_text: str, new_text: str) -> None:
+        if not old_text or not new_text or old_text == new_text:
+            return
+        if old_text in self.meta and new_text not in self.meta:
+            self.meta[new_text] = self.meta.get(old_text, {})
+        if old_text in self.meta:
+            try:
+                del self.meta[old_text]
+            except Exception:
+                pass
+
+    def _meta_summary(self, text: str) -> str:
+        info = self.meta.get(text) if isinstance(self.meta, dict) else None
+        if not isinstance(info, dict):
+            return ""
+        created = str(info.get("created_at") or "")
+        app = str(info.get("source_app") or "")
+        title = str(info.get("window_title") or "")
+        cnt = str(info.get("copy_count") or "")
+
+        parts = []
+        if created:
+            parts.append(f"Captured: {created}")
+        if app or title:
+            parts.append(f"From: {app}{' — ' if app and title else ''}{title}")
+        if cnt:
+            parts.append(f"Seen: {cnt}x")
+        return "   |   ".join(parts)
+
+    def _render_template(self, s: str) -> str:
+        """Render a snippet/template with basic placeholders.
+
+        Supported:
+          {date}, {time}, {datetime}, {clipboard}
+        """
+        try:
+            now = datetime.now()
+            out = s
+            out = out.replace("{date}", now.strftime("%Y-%m-%d"))
+            out = out.replace("{time}", now.strftime("%H:%M"))
+            out = out.replace("{datetime}", now.strftime("%Y-%m-%d %H:%M"))
+            if "{clipboard}" in out:
+                try:
+                    out = out.replace("{clipboard}", str(pyperclip.paste() or ""))
+                except Exception:
+                    out = out.replace("{clipboard}", "")
+            return out
+        except Exception:
+            return s
+
 
     def _prune_preserving_favorites(self, items: list[str], capacity: int) -> tuple[list[str], bool]:
         """
@@ -580,10 +731,16 @@ class Copy2AppBase:
         if items and items[-1] == text:
             return
 
+        existed = (text in items)
+
         # Stable de-dupe: remove previous occurrences
-        if text in items:
+        if existed:
             items = [x for x in items if x != text]
         items.append(text)
+
+        # Metadata update (best-effort)
+        self._touch_meta(text, is_new=(not existed))
+
 
         cap = self.settings.max_history
 
@@ -703,9 +860,22 @@ class Copy2AppBase:
             self._set_preview_text("", mark_clean=True)
             return
 
+        if hasattr(self, 'meta_var') and self.meta_var is not None:
+            try:
+                self.meta_var.set("")
+            except Exception:
+                pass
+
         self._selected_item_text = t
         display = self._get_preview_display_text_for_item(t)
         self._set_preview_text(display, mark_clean=True)
+
+        # Metadata banner
+        if hasattr(self, 'meta_var') and self.meta_var is not None:
+            try:
+                self.meta_var.set(self._meta_summary(t))
+            except Exception:
+                pass
 
         if self.search_query:
             self._highlight_query_in_preview(self.search_query)
@@ -813,6 +983,9 @@ class Copy2AppBase:
 
         items = [x for x in self.history if x != old]
         items.append(new)
+
+        # move metadata to new key
+        self._move_meta_key(old, new)
 
         # favorites map update
         if old in self.favorites:
@@ -925,10 +1098,353 @@ class Copy2AppBase:
         self.status_var.set(f"Combined {len(parts)} items into new entry — {now_ts()}")
 
     # -----------------------------
+    # Format tools (Preview)
+    # -----------------------------
+    def _get_preview_text(self) -> str:
+        return self.preview.get("1.0", tk.END).rstrip("\n")
+
+    def _set_preview_text_dirty(self, new_text: str):
+        self.preview.delete("1.0", tk.END)
+        self.preview.insert("1.0", new_text)
+        self._preview_dirty = True
+        self._update_preview_dirty_ui()
+        if self.search_query:
+            self._highlight_query_in_preview(self.search_query)
+
+    def _fmt_trim(self):
+        t = self._get_preview_text()
+        lines = [ln.rstrip() for ln in t.splitlines()]
+        out = "\n".join(lines).strip()
+        self._set_preview_text_dirty(out)
+
+    def _fmt_normalize_newlines(self):
+        t = self._get_preview_text()
+        out = t.replace("\r\n", "\n").replace("\r", "\n")
+        self._set_preview_text_dirty(out)
+
+    def _fmt_remove_dupe_spaces(self):
+        t = self._get_preview_text()
+        out_lines = []
+        for ln in t.splitlines():
+            # preserve leading indentation
+            m = re.match(r"^(\s*)(.*)$", ln)
+            indent = m.group(1) if m else ""
+            rest = m.group(2) if m else ln
+            rest = re.sub(r"[ \t]{2,}", " ", rest)
+            out_lines.append(indent + rest)
+        self._set_preview_text_dirty("\n".join(out_lines))
+
+    def _fmt_upper(self):
+        self._set_preview_text_dirty(self._get_preview_text().upper())
+
+    def _fmt_lower(self):
+        self._set_preview_text_dirty(self._get_preview_text().lower())
+
+    def _fmt_title(self):
+        self._set_preview_text_dirty(self._get_preview_text().title())
+
+    def _fmt_sentence(self):
+        t = self._get_preview_text().strip()
+        if not t:
+            return
+        out = t[:1].upper() + t[1:]
+        self._set_preview_text_dirty(out)
+
+    def _fmt_sanitize(self):
+        t = self._get_preview_text()
+        # Remove common zero-width + most control chars, but keep tab/newline
+        t = re.sub(r"[\u200B-\u200D\uFEFF]", "", t)
+        out = []
+        for ch in t:
+            o = ord(ch)
+            if ch in ("\n", "\t"):
+                out.append(ch)
+                continue
+            if o < 32:
+                continue
+            out.append(ch)
+        self._set_preview_text_dirty("".join(out))
+
+    def _fmt_strip_blank_lines(self):
+        t = self._get_preview_text()
+        lines = [ln for ln in t.splitlines() if ln.strip() != ""]
+        self._set_preview_text_dirty("\n".join(lines))
+
+    def _open_format_menu(self):
+        try:
+            m = tk.Menu(self, tearoff=0)
+            m.add_command(label='Trim whitespace', command=self._fmt_trim)
+            m.add_command(label='Normalize newlines', command=self._fmt_normalize_newlines)
+            m.add_command(label='Remove duplicate spaces', command=self._fmt_remove_dupe_spaces)
+            m.add_separator()
+            m.add_command(label='UPPERCASE', command=self._fmt_upper)
+            m.add_command(label='lowercase', command=self._fmt_lower)
+            m.add_command(label='Title Case', command=self._fmt_title)
+            m.add_command(label='Sentence case', command=self._fmt_sentence)
+            m.add_separator()
+            m.add_command(label='Sanitize (remove zero-width/control chars)', command=self._fmt_sanitize)
+            m.add_command(label='Remove blank lines', command=self._fmt_strip_blank_lines)
+
+            # Popup near mouse
+            x = self.winfo_pointerx()
+            y = self.winfo_pointery()
+            m.tk_popup(x, y)
+        finally:
+            try:
+                m.grab_release()
+            except Exception:
+                pass
+
+    # -----------------------------
+    # Actions
+    # -----------------------------
+    def _looks_like_url(self, s: str) -> bool:
+        if not s:
+            return False
+        s = s.strip()
+        if re.match(r"^https?://", s, re.IGNORECASE):
+            return True
+        # domain.tld style
+        if re.match(r"^[a-z0-9.-]+\.[a-z]{2,}(/.*)?$", s, re.IGNORECASE):
+            return True
+        return False
+
+    def _action_open_url(self):
+        t = self._get_selected_text() or self._get_preview_text()
+        if not t:
+            return
+        t = t.strip()
+        if not self._looks_like_url(t):
+            messagebox.showinfo(APP_NAME, "Selected content does not look like a URL.")
+            return
+        if not re.match(r"^https?://", t, re.IGNORECASE):
+            t = "https://" + t
+        try:
+            webbrowser.open(t)
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"Failed to open URL:\n{e}")
+
+    def _action_save_selected_as_txt(self):
+        t = self._get_selected_text() or self._get_preview_text()
+        if not t:
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save item as",
+            defaultextension=".txt",
+            filetypes=[("Text", "*.txt"), ("All files", "*.*")],
+            initialfile="copy2_item.txt",
+        )
+        if not path:
+            return
+        try:
+            Path(path).write_text(t, encoding="utf-8")
+            self.status_var.set(f"Saved to {path} — {now_ts()}")
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"Save failed:\n{e}")
+
+    def _action_open_in_editor(self):
+        t = self._get_selected_text() or self._get_preview_text()
+        if not t:
+            return
+        try:
+            tmp = Path(tempfile.mkdtemp(prefix="copy2_open_")) / "copy2_item.txt"
+            tmp.write_text(t, encoding="utf-8")
+            if os.name == "nt":
+                os.startfile(str(tmp))
+            else:
+                webbrowser.open(tmp.as_uri())
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"Open failed:\n{e}")
+
+    def _action_show_details(self):
+        t = self._get_selected_text()
+        if not t:
+            return
+        info = self.meta.get(t, {}) if isinstance(self.meta, dict) else {}
+        lines = [f"Text length: {len(t)}"]
+        if isinstance(info, dict):
+            for k in ("created_at", "updated_at", "copy_count", "source_app", "window_title"):
+                v = info.get(k)
+                if v:
+                    lines.append(f"{k}: {v}")
+        messagebox.showinfo(APP_NAME, "\n".join(lines))
+
+    # -----------------------------
+    # Snippets / Templates
+    # -----------------------------
+    def _open_snippets(self):
+        dlg = tk.Toplevel(self)
+        dlg.title("Snippets")
+        dlg.resizable(True, True)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        if USE_TTKB:
+            Frame = tb.Frame
+            Label = tb.Label
+            Button = tb.Button
+            Entry = tb.Entry
+        else:
+            from tkinter import ttk as _ttk  # type: ignore
+            Frame = _ttk.Frame
+            Label = _ttk.Label
+            Button = _ttk.Button
+            Entry = _ttk.Entry
+
+        root = Frame(dlg, padding=12)
+        root.pack(fill=tk.BOTH, expand=True)
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(1, weight=1)
+
+        Label(root, text="Snippets (templates)", font=("Segoe UI", 11, "bold")).grid(row=0, column=0, sticky="w")
+
+        lb = tk.Listbox(root, activestyle="dotbox", exportselection=False)
+        lb.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+
+        sb = tk.Scrollbar(root, orient="vertical", command=lb.yview)
+        sb.grid(row=1, column=1, sticky="ns", pady=(10, 0))
+        lb.configure(yscrollcommand=sb.set)
+
+        hint = ("Placeholders: {date}, {time}, {datetime}, {clipboard}")
+        Label(root, text=hint, foreground="#666").grid(row=2, column=0, sticky="w", pady=(10, 0))
+
+        def refresh():
+            lb.delete(0, tk.END)
+            for s in self.snippets:
+                name = str(s.get('name') or '')
+                trig = str(s.get('trigger') or '')
+                lb.insert(tk.END, f"{trig} — {name}" if name else trig)
+
+        def get_sel_index() -> int | None:
+            try:
+                sel = lb.curselection()
+                if not sel:
+                    return None
+                return int(sel[0])
+            except Exception:
+                return None
+
+        def add_or_edit(idx: int | None):
+            data = self.snippets[idx] if idx is not None and 0 <= idx < len(self.snippets) else {'name': '', 'trigger': '', 'body': ''}
+
+            ed = tk.Toplevel(dlg)
+            ed.title('Edit Snippet' if idx is not None else 'Add Snippet')
+            ed.resizable(True, True)
+            ed.transient(dlg)
+            ed.grab_set()
+
+            frm = Frame(ed, padding=12)
+            frm.pack(fill=tk.BOTH, expand=True)
+            frm.columnconfigure(1, weight=1)
+            frm.rowconfigure(2, weight=1)
+
+            Label(frm, text='Name').grid(row=0, column=0, sticky='w')
+            name_var = tk.StringVar(value=str(data.get('name') or ''))
+            Entry(frm, textvariable=name_var).grid(row=0, column=1, sticky='ew', padx=(10, 0))
+
+            Label(frm, text='Trigger').grid(row=1, column=0, sticky='w', pady=(10, 0))
+            trig_var = tk.StringVar(value=str(data.get('trigger') or ''))
+            Entry(frm, textvariable=trig_var).grid(row=1, column=1, sticky='ew', padx=(10, 0), pady=(10, 0))
+
+            Label(frm, text='Body').grid(row=2, column=0, sticky='nw', pady=(10, 0))
+            body = tk.Text(frm, wrap='word', undo=True, height=10)
+            body.grid(row=2, column=1, sticky='nsew', padx=(10, 0), pady=(10, 0))
+            body.insert('1.0', str(data.get('body') or ''))
+
+            btns = Frame(frm)
+            btns.grid(row=3, column=0, columnspan=2, sticky='e', pady=(12, 0))
+
+            def save_snip():
+                trig = trig_var.get().strip()
+                if not trig:
+                    messagebox.showwarning(APP_NAME, 'Trigger is required.')
+                    return
+                new_data = {
+                    'name': name_var.get().strip(),
+                    'trigger': trig,
+                    'body': body.get('1.0', tk.END).rstrip('\n'),
+                }
+
+                # Enforce unique triggers
+                for i, s in enumerate(self.snippets):
+                    if i != (idx if idx is not None else -1) and str(s.get('trigger') or '').strip() == trig:
+                        messagebox.showwarning(APP_NAME, 'That trigger already exists.')
+                        return
+
+                if idx is None:
+                    self.snippets.append(new_data)
+                else:
+                    self.snippets[idx] = new_data
+
+                self._persist()
+                refresh()
+                ed.destroy()
+
+            Button(btns, text='Cancel', command=ed.destroy).grid(row=0, column=0, padx=(0, 10))
+            Button(btns, text='Save', command=save_snip).grid(row=0, column=1)
+
+        def delete_sel():
+            idx = get_sel_index()
+            if idx is None:
+                return
+            if not messagebox.askyesno(APP_NAME, 'Delete this snippet?'):
+                return
+            try:
+                self.snippets.pop(idx)
+            except Exception:
+                return
+            self._persist()
+            refresh()
+
+        def copy_sel():
+            idx = get_sel_index()
+            if idx is None:
+                return
+            s = self.snippets[idx]
+            body = self._render_template(str(s.get('body') or ''))
+            if not body:
+                return
+            try:
+                pyperclip.copy(body)
+            except Exception:
+                return
+            self._add_history_item(body)
+            self.status_var.set(f"Snippet copied — {now_ts()}")
+
+        def insert_into_preview():
+            idx = get_sel_index()
+            if idx is None:
+                return
+            s = self.snippets[idx]
+            body = self._render_template(str(s.get('body') or ''))
+            if not body:
+                return
+            try:
+                self.preview.insert(tk.INSERT, body)
+                self._mark_preview_dirty()
+            except Exception:
+                pass
+
+        actions = Frame(root)
+        actions.grid(row=3, column=0, columnspan=2, sticky='ew', pady=(12, 0))
+
+        Button(actions, text='Add', command=lambda: add_or_edit(None)).pack(side=tk.LEFT)
+        Button(actions, text='Edit', command=lambda: add_or_edit(get_sel_index())).pack(side=tk.LEFT, padx=(8, 0))
+        Button(actions, text='Delete', command=delete_sel).pack(side=tk.LEFT, padx=(8, 0))
+
+        Button(actions, text='Copy to Clipboard', command=copy_sel).pack(side=tk.RIGHT)
+        Button(actions, text='Insert into Preview', command=insert_into_preview).pack(side=tk.RIGHT, padx=(0, 8))
+
+        refresh()
+
+
+    # -----------------------------
     # Find / Highlight
     # -----------------------------
     def _highlight_query_in_preview(self, query: str):
         self.preview.tag_remove("match", "1.0", tk.END)
+        self._preview_match_spans = []
+        self._preview_match_i = 0
         if not query:
             return
 
@@ -937,19 +1453,25 @@ class Copy2AppBase:
             return
 
         pattern = re.compile(re.escape(query), re.IGNORECASE)
-        m = pattern.search(text)
-        if not m:
+        for m in pattern.finditer(text):
+            self._preview_match_spans.append((m.start(), m.end()))
+
+        if not self._preview_match_spans:
             return
 
-        start_index = f"1.0+{m.start()}c"
-        end_index = f"1.0+{m.end()}c"
-
-        self.preview.tag_add("match", start_index, end_index)
         try:
             self.preview.tag_config("match", background="#2b78ff", foreground="white")
         except Exception:
             pass
-        self.preview.see(start_index)
+
+        for a, b in self._preview_match_spans:
+            start_index = f"1.0+{a}c"
+            end_index = f"1.0+{b}c"
+            self.preview.tag_add("match", start_index, end_index)
+
+        # Scroll to first match
+        a0, _b0 = self._preview_match_spans[0]
+        self.preview.see(f"1.0+{a0}c")
 
     def _search(self):
         q = self.search_var.get().strip()
@@ -962,9 +1484,35 @@ class Copy2AppBase:
             self.preview.tag_remove("match", "1.0", tk.END)
             return
 
-        for item in list(self.history):
-            if q.lower() in item.lower():
-                self.search_matches.append(item)
+        ql = q.lower()
+        items = list(self.history)
+
+        # Fuzzy search (optional)
+        fuzzy = False
+        if hasattr(self, 'fuzzy_var') and self.fuzzy_var is not None:
+            try:
+                fuzzy = bool(self.fuzzy_var.get())
+            except Exception:
+                fuzzy = False
+
+        if not fuzzy:
+            for item in items:
+                if ql in item.lower():
+                    self.search_matches.append(item)
+        else:
+            scored: list[tuple[float, str]] = []
+            for item in items:
+                il = item.lower()
+                if ql in il:
+                    # strong signal
+                    scored.append((2.0, item))
+                    continue
+                # Sequence similarity
+                r = difflib.SequenceMatcher(None, ql, il[: min(len(il), 600)]).ratio()
+                if r >= 0.35:
+                    scored.append((r, item))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            self.search_matches = [it for _s, it in scored[:250]]
 
         if not self.search_matches:
             self.status_var.set(f"No matches for: {q}")
@@ -980,6 +1528,14 @@ class Copy2AppBase:
             return
         self.search_index = (self.search_index + direction) % len(self.search_matches)
         self._jump_to_item(self.search_matches[self.search_index], highlight_query=self.search_query)
+
+    def _jump_preview_match(self, direction: int):
+        if not self._preview_match_spans:
+            return
+        self._preview_match_i = (self._preview_match_i + direction) % len(self._preview_match_spans)
+        a, _b = self._preview_match_spans[self._preview_match_i]
+        self.preview.see(f"1.0+{a}c")
+
 
     def _jump_to_item(self, item_text: str, highlight_query: str = ""):
         if item_text not in self.view_items and self._current_filter() != "all":
@@ -1200,6 +1756,10 @@ class Copy2AppBase:
     def _build_context_menu(self):
         self.menu = tk.Menu(self, tearoff=0)
         self.menu.add_command(label="Copy", command=self._copy_selected)
+        self.menu.add_command(label="Open as URL", command=self._action_open_url)
+        self.menu.add_command(label="Open in Editor", command=self._action_open_in_editor)
+        self.menu.add_command(label="Save as .txt...", command=self._action_save_selected_as_txt)
+        self.menu.add_command(label="Details...", command=self._action_show_details)
         self.menu.add_command(label="Favorite / Unfavorite", command=self._toggle_favorite_selected)
         self.menu.add_separator()
         self.menu.add_command(label="Save Preview Edit", command=self._save_preview_edits)
@@ -1207,6 +1767,9 @@ class Copy2AppBase:
         self.menu.add_separator()
         self.menu.add_command(label="Delete", command=self._delete_selected)
         self.menu.add_command(label="Combine Selected", command=self._combine_selected)
+
+        self.menu.add_separator()
+        self.menu.add_command(label="Snippets...", command=self._open_snippets)
 
         def popup(event):
             try:
@@ -1607,6 +2170,11 @@ if USE_TTKB:
             self.search_entry = tb.Entry(search_box, textvariable=self.search_var)
             self.search_entry.pack(side=LEFT, fill=X, expand=True)
 
+            self.fuzzy_var = tk.BooleanVar(value=False)
+            fuzzy_btn = tb.Checkbutton(search_box, text="Fuzzy", variable=self.fuzzy_var, bootstyle="round-toggle")
+            fuzzy_btn.pack(side=LEFT, padx=(10, 0))
+            ToolTip(fuzzy_btn, "Fuzzy search (approximate matching)")
+
             btn_find = tb.Button(search_box, text="Find", command=self._search, bootstyle=PRIMARY)
             btn_find.pack(side=LEFT, padx=(10, 0))
             ToolTip(btn_find, "Find (Enter)")
@@ -1646,6 +2214,10 @@ if USE_TTKB:
             btn_import = tb.Button(action_box, text="Import", command=self._import, bootstyle=OUTLINE)
             btn_import.pack(side=LEFT, padx=(0, 8))
             ToolTip(btn_import, "Import (Ctrl+I)")
+
+            btn_snips = tb.Button(action_box, text="Snippets", command=self._open_snippets, bootstyle=SECONDARY)
+            btn_snips.pack(side=LEFT, padx=(0, 8))
+            ToolTip(btn_snips, "Manage snippets / templates")
 
             btn_settings = tb.Button(action_box, text="Settings", command=self._open_settings, bootstyle=SECONDARY)
             btn_settings.pack(side=LEFT)
@@ -1727,8 +2299,17 @@ if USE_TTKB:
             rev_btn.pack(side=LEFT)
             ToolTip(rev_btn, "Reverse lines in Preview and Copy")
 
+            # Metadata banner
+            self.meta_var = tk.StringVar(value="")
+            tb.Label(preview_actions, textvariable=self.meta_var, font=("Segoe UI", 9), foreground="#666").pack(side=LEFT, padx=(12, 0))
+
             self.preview_dirty_var = tk.StringVar(value="")
             tb.Label(preview_actions, textvariable=self.preview_dirty_var).pack(side=LEFT, padx=(10, 0))
+
+            # Format tools menu
+            fmt_btn = tb.Button(preview_actions, text="Format", bootstyle=OUTLINE, command=self._open_format_menu)
+            fmt_btn.pack(side=RIGHT, padx=(0, 8))
+            ToolTip(fmt_btn, "Format tools (trim, case, sanitize, etc.)")
 
             self.revert_btn = tb.Button(preview_actions, text="Revert", command=self._revert_preview_edits, bootstyle=WARNING)
             self.revert_btn.pack(side=RIGHT, padx=(0, 8))
@@ -1768,6 +2349,9 @@ if USE_TTKB:
             self.bind("<Control-l>", lambda e: (self._clean_keep_favorites(), "break"))
             self.bind("<Control-s>", lambda e: (self._save_preview_edits(), "break"))
             self.bind("<Escape>", lambda e: (self._revert_preview_edits(), "break"))
+            self.bind("<Control-Shift-Next>", lambda e: (self._jump_preview_match(1), "break"))
+            self.bind("<Control-Shift-Prior>", lambda e: (self._jump_preview_match(-1), "break"))
+            self.bind("<Control-Alt-s>", lambda e: (self._open_snippets(), "break"))
 
         def _on_close(self):
             try:
