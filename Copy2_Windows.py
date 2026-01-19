@@ -47,6 +47,36 @@ import tempfile
 import threading
 import shutil
 import webbrowser
+import base64
+import hashlib
+import secrets
+import ctypes
+
+# Optional: imaging (clipboard images + screenshots)
+try:
+    from PIL import Image, ImageTk, ImageGrab  # type: ignore
+except Exception:
+    Image = ImageTk = ImageGrab = None
+
+# Optional: encryption for exports
+try:
+    from cryptography.fernet import Fernet  # type: ignore
+except Exception:
+    Fernet = None
+
+# Optional: key derivation for encryption-at-rest and encrypted exports
+try:
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC  # type: ignore
+    from cryptography.hazmat.primitives import hashes  # type: ignore
+except Exception:
+    PBKDF2HMAC = None
+    hashes = None
+
+# Optional: Windows start-on-boot
+try:
+    import winreg  # type: ignore
+except Exception:
+    winreg = None
 from collections import deque
 from dataclasses import dataclass, asdict
 from datetime import datetime
@@ -104,12 +134,13 @@ APP_ID = "copy2"
 VENDOR = "MellowsLab"
 
 # App version (display + update compare)
-APP_VERSION = "1.0.6"  # <-- keep this in sync with your build/tag
+APP_VERSION = "1.0.7"  # <-- keep this in sync with your build/tag
 
 # History indicator icons (you can change these to any emoji you like)
 PIN_ICON = "📌"
 FAV_ICON = "⭐"
 TAG_ICON = "🏷️"
+IMAGE_ICON = "🖼️"
 
 DEFAULT_MAX_HISTORY = 50
 DEFAULT_POLL_MS = 400
@@ -251,11 +282,24 @@ class Settings:
     enable_global_hotkeys: bool = False
     hotkey_quick_paste: str = "ctrl+alt+v"
     hotkey_paste_last: str = "ctrl+alt+shift+v"
+    hotkey_toggle_pause: str = "ctrl+alt+p"
 
     # File-based sync (point to a cloud-synced folder like OneDrive/Dropbox)
     sync_enabled: bool = False
     sync_folder: str = ""
     sync_interval_sec: int = 10
+
+    # Advanced features (ALL disabled by default)
+    advanced_features: bool = True
+    adv_app_lock: bool = False
+    adv_start_on_boot: bool = True
+    adv_encrypt_exports: bool = False
+    adv_encrypt_all_data: bool = False
+    adv_images: bool = False
+    adv_screenshots: bool = False
+    adv_snippets: bool = False
+    adv_tmplt_trigger: bool = False
+    tmplt_trigger_word: str = "tmplt"
 
     @staticmethod
     def from_dict(d: dict) -> "Settings":
@@ -272,15 +316,31 @@ class Settings:
         s.enable_global_hotkeys = bool(d.get("enable_global_hotkeys", False))
         s.hotkey_quick_paste = str(d.get("hotkey_quick_paste", "ctrl+alt+v"))
         s.hotkey_paste_last = str(d.get("hotkey_paste_last", "ctrl+alt+shift+v"))
+        s.hotkey_toggle_pause = str(d.get("hotkey_toggle_pause", "ctrl+alt+p"))
 
         s.sync_enabled = bool(d.get("sync_enabled", False))
         s.sync_folder = str(d.get("sync_folder", "")).strip()
         s.sync_interval_sec = int(d.get("sync_interval_sec", 10))
 
+        # Defaults: Advanced is enabled by default, and Start-on-boot is enabled by default.
+        # Other advanced switches remain opt-in.
+        s.advanced_features = bool(d.get("advanced_features", True))
+        s.adv_app_lock = bool(d.get("adv_app_lock", False))
+        s.adv_start_on_boot = bool(d.get("adv_start_on_boot", True))
+        s.adv_encrypt_exports = bool(d.get("adv_encrypt_exports", False))
+        s.adv_encrypt_all_data = bool(d.get("adv_encrypt_all_data", False))
+        s.adv_images = bool(d.get("adv_images", False))
+        s.adv_screenshots = bool(d.get("adv_screenshots", False))
+        s.adv_snippets = bool(d.get("adv_snippets", False))
+        s.adv_tmplt_trigger = bool(d.get("adv_tmplt_trigger", False))
+        s.tmplt_trigger_word = str(d.get("tmplt_trigger_word", "tmplt"))
+
         s.max_history = max(5, min(HARD_MAX_HISTORY, s.max_history))
         s.poll_ms = max(100, min(5000, s.poll_ms))
         s.pane_sash = max(220, min(900, s.pane_sash))
         s.sync_interval_sec = max(3, min(300, s.sync_interval_sec))
+        if not s.tmplt_trigger_word.strip():
+            s.tmplt_trigger_word = "tmplt"
         return s
 
 
@@ -531,6 +591,12 @@ class Copy2AppBase:
         self.tags_path = self.data_dir / "tags.json"
         self.tag_colors_path = self.data_dir / "tag_colors.json"
         self.expiry_path = self.data_dir / "expiry.json"
+        # Advanced feature storage (optional)
+        self.security_path = self.data_dir / "security.json"
+        self.images_dir = self.data_dir / "images"
+        self.images_meta_path = self.data_dir / "images.json"
+        self.snippets_path = self.data_dir / "snippets.json"
+
 
         # Sync folder state
         self._sync_mtimes = {}
@@ -542,94 +608,142 @@ class Copy2AppBase:
 
         self.settings = Settings.from_dict(safe_json_load(self.settings_path, {}))
 
-        # Normalize stored favorites to unique list
-        favs = safe_json_load(self.favs_path, [])
-        if isinstance(favs, list):
-            favs = [x for x in favs if isinstance(x, str)]
+        # Advanced runtime state (optional features are OFF by default)
+        sec = safe_json_load(self.security_path, {})
+        self.security = sec if isinstance(sec, dict) else {}
+        self._unlocked = True  # set to False on startup if App Lock is enabled and a PIN exists
+        self._pin_session_verified = False
+
+        # If Encrypt-All is enabled and a PIN is required, defer loading encrypted stores until unlock.
+        self._stores_loaded = True
+        self._captured_while_locked = deque()
+        try:
+            if self._enc_all_enabled() and self._startup_requires_unlock():
+                self._stores_loaded = False
+        except Exception:
+            self._stores_loaded = True
+
+
+        if self._stores_loaded:
+                # Images (optional) — use store loader so Encrypt-All files don't break parsing
+                meta = self._store_load_json(self.images_meta_path, [])
+                self.images = meta if isinstance(meta, list) else []
+                self._last_image_sig = ''
+
+                # Snippets/Templates (optional) — use store loader so Encrypt-All files don't break parsing
+                sn = self._store_load_json(self.snippets_path, {'templates': []})
+                if isinstance(sn, dict) and isinstance(sn.get('templates'), list):
+                    self.snippets = sn.get('templates')
+                elif isinstance(sn, list):
+                    self.snippets = sn
+                else:
+                    self.snippets = []
+
+                # Template trigger hook state
+                self._tmplt_hook = None
+                self._tmplt_buffer = ''
+                self._tmplt_last_ts = 0.0
+
+                # Normalize stored favorites to unique list
+                favs = self._store_load_json(self.favs_path, [])
+                if isinstance(favs, list):
+                    favs = [x for x in favs if isinstance(x, str)]
+                else:
+                    favs = []
+                # preserve order, unique
+                seen = set()
+                self.favorites = []
+                for x in favs:
+                    if x not in seen:
+                        self.favorites.append(x)
+                        seen.add(x)
+
+                # Pins
+                pins = self._store_load_json(self.pins_path, [])
+                if isinstance(pins, list):
+                    pins = [x for x in pins if isinstance(x, str)]
+                else:
+                    pins = []
+                self.pins = []
+                seenp = set()
+                for x in pins:
+                    if x not in seenp:
+                        self.pins.append(x)
+                        seenp.add(x)
+
+                # Tags: {clip_text: [tag, ...]}
+                tags = self._store_load_json(self.tags_path, {})
+                if not isinstance(tags, dict):
+                    tags = {}
+                norm_tags = {}
+                for k,v in tags.items():
+                    if not isinstance(k, str):
+                        continue
+                    if isinstance(v, list):
+                        vals = [str(t).strip() for t in v if str(t).strip()]
+                    else:
+                        vals = []
+                    # unique preserve order
+                    seen_t=set()
+                    out=[]
+                    for t in vals:
+                        if t not in seen_t:
+                            out.append(t)
+                            seen_t.add(t)
+                    if out:
+                        norm_tags[k]=out
+                self.tags = norm_tags
+
+                # Tag colors: {tag_name: '#RRGGBB'}
+                tc = self._store_load_json(self.tag_colors_path, {})
+                if not isinstance(tc, dict):
+                    tc = {}
+                norm_tc = {}
+                for k, v in tc.items():
+                    if not isinstance(k, str) or not isinstance(v, str):
+                        continue
+                    kk = k.strip()
+                    vv = v.strip()
+                    if kk and vv:
+                        norm_tc[kk] = vv
+                self.tag_colors = norm_tc
+
+                # Expiry: {clip_text: unix_ts}
+                exp = self._store_load_json(self.expiry_path, {})
+                if not isinstance(exp, dict):
+                    exp = {}
+                norm_exp = {}
+                for k,v in exp.items():
+                    if not isinstance(k, str):
+                        continue
+                    try:
+                        ts = float(v)
+                        norm_exp[k] = ts
+                    except Exception:
+                        pass
+                self.expiry = norm_exp
+
+                self._last_expiry_purge = 0.0
+
+                hist = self._store_load_json(self.history_path, [])
+                if isinstance(hist, list):
+                    hist = [x for x in hist if isinstance(x, str)]
+                else:
+                    hist = []
+
+                self.history = deque(hist, maxlen=self.settings.max_history)
         else:
-            favs = []
-        # preserve order, unique
-        seen = set()
-        self.favorites = []
-        for x in favs:
-            if x not in seen:
-                self.favorites.append(x)
-                seen.add(x)
-
-        # Pins
-        pins = safe_json_load(self.pins_path, [])
-        if isinstance(pins, list):
-            pins = [x for x in pins if isinstance(x, str)]
-        else:
-            pins = []
-        self.pins = []
-        seenp = set()
-        for x in pins:
-            if x not in seenp:
-                self.pins.append(x)
-                seenp.add(x)
-
-        # Tags: {clip_text: [tag, ...]}
-        tags = safe_json_load(self.tags_path, {})
-        if not isinstance(tags, dict):
-            tags = {}
-        norm_tags = {}
-        for k,v in tags.items():
-            if not isinstance(k, str):
-                continue
-            if isinstance(v, list):
-                vals = [str(t).strip() for t in v if str(t).strip()]
-            else:
-                vals = []
-            # unique preserve order
-            seen_t=set()
-            out=[]
-            for t in vals:
-                if t not in seen_t:
-                    out.append(t)
-                    seen_t.add(t)
-            if out:
-                norm_tags[k]=out
-        self.tags = norm_tags
-
-        # Tag colors: {tag_name: '#RRGGBB'}
-        tc = safe_json_load(self.tag_colors_path, {})
-        if not isinstance(tc, dict):
-            tc = {}
-        norm_tc = {}
-        for k, v in tc.items():
-            if not isinstance(k, str) or not isinstance(v, str):
-                continue
-            kk = k.strip()
-            vv = v.strip()
-            if kk and vv:
-                norm_tc[kk] = vv
-        self.tag_colors = norm_tc
-
-        # Expiry: {clip_text: unix_ts}
-        exp = safe_json_load(self.expiry_path, {})
-        if not isinstance(exp, dict):
-            exp = {}
-        norm_exp = {}
-        for k,v in exp.items():
-            if not isinstance(k, str):
-                continue
-            try:
-                ts = float(v)
-                norm_exp[k] = ts
-            except Exception:
-                pass
-        self.expiry = norm_exp
-
-        self._last_expiry_purge = 0.0
-
-        hist = safe_json_load(self.history_path, [])
-        if isinstance(hist, list):
-            hist = [x for x in hist if isinstance(x, str)]
-        else:
-            hist = []
-
-        self.history = deque(hist, maxlen=self.settings.max_history)
+            # Deferred stores (locked + encrypt-all). Initialize empty runtime state and load on unlock.
+            self.images = []
+            self._last_image_sig = ''
+            self.snippets = []
+            self.favorites = []
+            self.pins = []
+            self.tags = {}
+            self.tag_colors = {}
+            self.expiry = {}
+            self._last_expiry_purge = 0.0
+            self.history = deque([], maxlen=self.settings.max_history)
 
         self.paused = False
         self.last_clip = ""
@@ -675,8 +789,895 @@ class Copy2AppBase:
             "Check Updates": "(Button)",
         }
 
+        # Advanced feature bootstrapping (does not enable anything by default)
+        try:
+            self._advanced_bootstrap()
+        except Exception:
+            pass
+
         # Ensure favorites remain present in history (optional)
         self._ensure_favorites_present()
+
+
+    # -----------------------------
+    # Advanced features (disabled by default)
+    # -----------------------------
+    def _adv(self, key: str) -> bool:
+        """Return True only if Advanced Features are enabled and the specific flag is enabled."""
+        try:
+            if not bool(getattr(self.settings, 'advanced_features', False)):
+                return False
+            return bool(getattr(self.settings, key, False))
+        except Exception:
+            return False
+
+    def _advanced_bootstrap(self):
+        """Create storage and register optional hooks. Never turns features on automatically."""
+        try:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        # Ensure images folder exists when the feature is enabled
+        if self._adv('adv_images') or self._adv('adv_screenshots'):
+            try:
+                self.images_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+
+        # Ensure default snippets exist when the feature is enabled
+        if self._adv('adv_snippets'):
+            try:
+                self._ensure_default_snippets()
+            except Exception:
+                pass
+
+        # Startup lock state (UI is enforced elsewhere)
+        try:
+            if self._startup_requires_unlock():
+                self._unlocked = False
+            else:
+                self._unlocked = True
+        except Exception:
+            self._unlocked = True
+
+        # Register/Unregister the template trigger hook
+        try:
+            self._register_tmplt_trigger()
+        except Exception:
+            pass
+
+    # ----- App lock (PIN) -----
+    def _pin_is_set(self) -> bool:
+        try:
+            return bool(self.security.get('pin_hash')) and bool(self.security.get('pin_salt'))
+        except Exception:
+            return False
+
+    def _pin_hash(self, pin: str, salt_b64: str, iters: int) -> str:
+        salt = base64.b64decode(salt_b64.encode('utf-8'))
+        dk = hashlib.pbkdf2_hmac('sha256', pin.encode('utf-8'), salt, int(iters))
+        return dk.hex()
+
+    def _verify_pin_value(self, pin: str) -> bool:
+        try:
+            if not self._pin_is_set():
+                return False
+            salt = str(self.security.get('pin_salt') or '')
+            iters = int(self.security.get('pin_iters') or 200_000)
+            expected = str(self.security.get('pin_hash') or '')
+            got = self._pin_hash(pin, salt, iters)
+            return secrets.compare_digest(got, expected)
+        except Exception:
+            return False
+
+    def _save_security(self):
+        try:
+            safe_json_save(self.security_path, self.security)
+        except Exception:
+            pass
+
+    def _set_or_change_pin_flow(self, parent=None):
+        parent = parent or self
+        # Always require the current PIN before changing it (prevents silent PIN takeover).
+        if self._pin_is_set():
+            cur = simpledialog.askstring(APP_NAME, 'Enter current PIN', parent=parent, show='*')
+            if cur is None:
+                return
+            if not self._verify_pin_value(cur):
+                messagebox.showerror(APP_NAME, 'Incorrect PIN.')
+                return
+            # Mark session verified after a successful check.
+            self._pin_session_verified = True
+
+        a = simpledialog.askstring(APP_NAME, 'Set new PIN', parent=parent, show='*')
+        if a is None:
+            return
+        b = simpledialog.askstring(APP_NAME, 'Confirm new PIN', parent=parent, show='*')
+        if b is None:
+            return
+        if a != b:
+            messagebox.showerror(APP_NAME, 'PINs do not match.')
+            return
+        if len(a.strip()) < 4:
+            messagebox.showerror(APP_NAME, 'PIN must be at least 4 characters.')
+            return
+
+        salt = base64.b64encode(secrets.token_bytes(16)).decode('utf-8')
+        iters = 200_000
+        h = self._pin_hash(a.strip(), salt, iters)
+        self.security['pin_salt'] = salt
+        self.security['pin_iters'] = iters
+        self.security['pin_hash'] = h
+        self._pin_session_verified = True
+        self._save_security()
+        messagebox.showinfo(APP_NAME, 'PIN updated.')
+
+    def _prompt_unlock_dialog(self) -> bool:
+        """Blocking unlock dialog. Returns True if unlocked, else False (Exit)."""
+        dlg = tk.Toplevel(self)
+        dlg.title('Unlock')
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+        try:
+            dlg.attributes('-topmost', True)
+        except Exception:
+            pass
+
+        frm = ttk.Frame(dlg, padding=18)
+        frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frm, text=APP_NAME, font=('Segoe UI', 14, 'bold')).pack(anchor='w')
+        ttk.Label(frm, text='Enter your PIN to unlock.').pack(anchor='w', pady=(6, 14))
+
+        pin_var = tk.StringVar(value='')
+        ent = ttk.Entry(frm, textvariable=pin_var, show='*', width=24)
+        ent.pack(anchor='w')
+        ent.focus_set()
+
+        status = tk.StringVar(value='')
+        ttk.Label(frm, textvariable=status, foreground='#c00').pack(anchor='w', pady=(8, 0))
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill=tk.X, pady=(14, 0))
+
+        result = {'ok': False}
+
+        def do_unlock(_evt=None):
+            p = pin_var.get() or ''
+            if self._verify_pin_value(p):
+                result['ok'] = True
+                # Cache PIN in-memory for this session so encrypted-at-rest stores can be read.
+                try:
+                    self._session_pin = str(p).strip()
+                except Exception:
+                    self._session_pin = None
+                self._pin_session_verified = True
+                try:
+                    dlg.destroy()
+                except Exception:
+                    pass
+            else:
+                status.set('Incorrect PIN.')
+
+        def do_exit(_evt=None):
+            result['ok'] = False
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+
+        ttk.Button(btns, text='Exit', command=do_exit).pack(side=tk.RIGHT)
+        ttk.Button(btns, text='Unlock', command=do_unlock).pack(side=tk.RIGHT, padx=(0, 8))
+
+        dlg.protocol('WM_DELETE_WINDOW', do_exit)
+        dlg.bind('<Return>', do_unlock)
+        dlg.bind('<Escape>', do_exit)
+
+        # Center-ish
+        try:
+            dlg.update_idletasks()
+            w = dlg.winfo_width()
+            h = dlg.winfo_height()
+            x = max(40, int(self.winfo_screenwidth()/2 - w/2))
+            y = max(40, int(self.winfo_screenheight()/2 - h/2))
+            dlg.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            pass
+
+        self.wait_window(dlg)
+        return bool(result['ok'])
+
+    def _unlock_startup_flow(self):
+        """Enforce App Lock on startup. If user cancels, exit the app."""
+        try:
+            if not (self._adv('adv_app_lock') and self._pin_is_set()):
+                self._unlocked = True
+                return
+            # Hide main window behind lock
+            try:
+                self.withdraw()
+            except Exception:
+                pass
+            ok = self._prompt_unlock_dialog()
+            if ok:
+                self._unlocked = True
+                self._pin_session_verified = True
+                try:
+                    self.deiconify()
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.destroy()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # ----- Start on boot (Windows) -----
+    def _set_start_on_boot(self, enabled: bool):
+        if winreg is None:
+            return
+        try:
+            run_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, run_key, 0, winreg.KEY_SET_VALUE) as k:
+                if enabled:
+                    # For frozen builds: sys.executable points to Copy2.exe
+                    exe = sys.executable
+                    if getattr(sys, 'frozen', False):
+                        cmd = f'"{exe}"'
+                    else:
+                        cmd = f'"{exe}" "{os.path.abspath(__file__)}"'
+                    winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ, cmd)
+                else:
+                    try:
+                        winreg.DeleteValue(k, APP_NAME)
+                    except FileNotFoundError:
+                        pass
+        except Exception:
+            pass
+
+    # ----- Snippets / Templates -----
+    def _ensure_default_snippets(self):
+        if getattr(self, 'snippets', None) is None:
+            self.snippets = []
+        if isinstance(self.snippets, list) and len(self.snippets) > 0:
+            return
+        now = now_ts()
+        self.snippets = [
+            {
+                'name': 'Professional — Email Reply',
+                'group': 'Professional',
+                'body': """Hi {name},
+
+Thanks for your message. {context}
+
+Next steps:
+- {next_step_1}
+- {next_step_2}
+
+Kind regards,
+{signature}""",
+                'created_at': now,
+                'updated_at': now,
+            },
+            {
+                'name': 'Professional — Meeting Agenda',
+                'group': 'Professional',
+                'body': """Agenda — {topic}
+
+1) Objective
+2) Updates
+3) Decisions
+4) Action items
+
+Attendees: {attendees}
+Time: {time}""",
+                'created_at': now,
+                'updated_at': now,
+            },
+            {
+                'name': 'Technical — Bug Report',
+                'group': 'Technical',
+                'body': """Title: {title}
+
+Environment:
+- App version: {version}
+- OS: {os}
+
+Steps to reproduce:
+1) {step1}
+2) {step2}
+
+Expected:
+{expected}
+
+Actual:
+{actual}
+
+Notes / logs:
+{notes}""",
+                'created_at': now,
+                'updated_at': now,
+            },
+            {
+                'name': 'Casual — Quick Reply',
+                'group': 'Casual',
+                'body': """Hey! {message}
+
+Thanks — {signature}""",
+                'created_at': now,
+                'updated_at': now,
+            },
+        ]
+        try:
+            self._save_snippets()
+        except Exception:
+            pass
+
+    def _save_snippets(self):
+        try:
+            self._store_save_json(self.snippets_path, {'templates': getattr(self, 'snippets', [])})
+        except Exception:
+            pass
+
+    def _paste_text_to_active_app(self, text: str):
+        if not isinstance(text, str):
+            text = str(text)
+        prev = None
+        try:
+            prev = self._clipboard_get_text()
+        except Exception:
+            prev = None
+        self._clipboard_set_text(text)
+        if _kbd is not None:
+            try:
+                _kbd.send('ctrl+v')
+            except Exception:
+                pass
+        # restore
+        if isinstance(prev, str):
+            try:
+                self._clipboard_set_text(prev)
+            except Exception:
+                pass
+
+    def _open_snippets_manager(self):
+        if not self._adv('adv_snippets'):
+            messagebox.showinfo(APP_NAME, 'Enable Snippets under Settings → Advanced Features.')
+            return
+        self._ensure_default_snippets()
+
+        dlg = tk.Toplevel(self)
+        dlg.title('Snippets / Templates')
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.geometry('920x580')
+        dlg.minsize(860, 520)
+
+        root = ttk.Frame(dlg, padding=10)
+        root.pack(fill=tk.BOTH, expand=True)
+        root.columnconfigure(0, weight=1)
+        root.columnconfigure(1, weight=2)
+        root.rowconfigure(1, weight=1)
+
+        ttk.Label(root, text='Search').grid(row=0, column=0, sticky='w')
+        q = tk.StringVar(value='')
+        ent = ttk.Entry(root, textvariable=q)
+        ent.grid(row=0, column=0, sticky='ew', pady=(6, 10), padx=(60, 10))
+
+        lst = tk.Listbox(root, exportselection=False)
+        lst.grid(row=1, column=0, sticky='nsew', padx=(0, 10))
+
+        editor = tk.Text(root, wrap='word', undo=True)
+        editor.grid(row=1, column=1, sticky='nsew')
+
+        btns = ttk.Frame(root)
+        btns.grid(row=2, column=0, columnspan=2, sticky='ew', pady=(10, 0))
+        btns.columnconfigure(0, weight=1)
+
+        state = {'items': [], 'sel': None}
+
+        def filtered():
+            qq = (q.get() or '').strip().lower()
+            out = []
+            for t in getattr(self, 'snippets', []) or []:
+                name = str(t.get('name') or '')
+                grp = str(t.get('group') or '')
+                body = str(t.get('body') or '')
+                if not qq or qq in name.lower() or qq in grp.lower() or qq in body.lower():
+                    out.append(t)
+            return out
+
+        def refresh():
+            items = filtered()
+            state['items'] = items
+            lst.delete(0, tk.END)
+            for t in items:
+                name = str(t.get('name') or 'Unnamed')
+                grp = str(t.get('group') or '')
+                prefix = f"[{grp}] " if grp else ''
+                lst.insert(tk.END, prefix + name)
+
+        def on_sel(_=None):
+            try:
+                i = int(lst.curselection()[0])
+            except Exception:
+                return
+            t = state['items'][i]
+            state['sel'] = t
+            editor.delete('1.0', tk.END)
+            editor.insert('1.0', str(t.get('body') or ''))
+
+        def new_template():
+            name = simpledialog.askstring(APP_NAME, 'Template name', parent=dlg)
+            if not name:
+                return
+            grp = simpledialog.askstring(APP_NAME, 'Group (optional)', parent=dlg) or ''
+            now = now_ts()
+            t = {'name': name.strip(), 'group': grp.strip(), 'body': '', 'created_at': now, 'updated_at': now}
+            self.snippets.append(t)
+            self._save_snippets()
+            refresh()
+            # select last
+            try:
+                lst.selection_clear(0, tk.END)
+                lst.selection_set(tk.END)
+                lst.see(tk.END)
+                on_sel()
+            except Exception:
+                pass
+
+        def save_template():
+            t = state.get('sel')
+            if not t:
+                return
+            t['body'] = editor.get('1.0', tk.END).rstrip("\n")
+            t['updated_at'] = now_ts()
+            self._save_snippets()
+            refresh()
+
+        def delete_template():
+            t = state.get('sel')
+            if not t:
+                return
+            if not messagebox.askyesno(APP_NAME, f"Delete template '{t.get('name')}'?"):
+                return
+            try:
+                self.snippets.remove(t)
+            except Exception:
+                pass
+            state['sel'] = None
+            editor.delete('1.0', tk.END)
+            self._save_snippets()
+            refresh()
+
+        def insert_into_app():
+            t = state.get('sel')
+            if not t:
+                return
+            self._paste_text_to_active_app(str(t.get('body') or ''))
+
+        def export_templates():
+            path = filedialog.asksaveasfilename(title='Export Templates', defaultextension='.json', filetypes=[('JSON','*.json')])
+            if not path:
+                return
+            try:
+                Path(path).write_text(json.dumps({'templates': self.snippets}, ensure_ascii=False, indent=2), encoding='utf-8')
+            except Exception as e:
+                messagebox.showerror(APP_NAME, f"Export failed\n{e}")
+
+        def import_templates():
+            path = filedialog.askopenfilename(title='Import Templates', filetypes=[('JSON','*.json')])
+            if not path:
+                return
+            try:
+                obj = json.loads(Path(path).read_text(encoding='utf-8'))
+                items = []
+                if isinstance(obj, dict) and isinstance(obj.get('templates'), list):
+                    items = obj.get('templates')
+                elif isinstance(obj, list):
+                    items = obj
+                clean = []
+                for t in items:
+                    if not isinstance(t, dict):
+                        continue
+                    name = str(t.get('name') or '').strip()
+                    if not name:
+                        continue
+                    clean.append({
+                        'name': name,
+                        'group': str(t.get('group') or '').strip(),
+                        'body': str(t.get('body') or ''),
+                        'created_at': str(t.get('created_at') or now_ts()),
+                        'updated_at': now_ts(),
+                    })
+                if clean:
+                    self.snippets.extend(clean)
+                    self._save_snippets()
+                    refresh()
+            except Exception as e:
+                messagebox.showerror(APP_NAME, f"Import failed\n{e}")
+
+        ttk.Button(btns, text='New', command=new_template).pack(side=tk.LEFT)
+        ttk.Button(btns, text='Save', command=save_template).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(btns, text='Delete', command=delete_template).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(btns, text='Insert into App', command=insert_into_app).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(btns, text='Import', command=import_templates).pack(side=tk.RIGHT)
+        ttk.Button(btns, text='Export', command=export_templates).pack(side=tk.RIGHT, padx=(0, 8))
+
+        lst.bind('<<ListboxSelect>>', on_sel)
+        q.trace_add('write', lambda *_: refresh())
+        refresh()
+        ent.focus_set()
+
+    # ----- Template trigger (tmplt) -----
+    def _unregister_tmplt_trigger(self):
+        try:
+            if _kbd is not None and getattr(self, '_tmplt_hook', None) is not None:
+                try:
+                    _kbd.unhook(self._tmplt_hook)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self._tmplt_hook = None
+        self._tmplt_buffer = ''
+        self._tmplt_last_ts = 0.0
+
+    def _register_tmplt_trigger(self):
+        self._unregister_tmplt_trigger()
+        if not (self._adv('adv_tmplt_trigger') and self._adv('adv_snippets')):
+            return
+        if _kbd is None:
+            return
+        trigger = str(getattr(self.settings, 'tmplt_trigger_word', 'tmplt') or 'tmplt').strip().lower()
+        if not trigger:
+            trigger = 'tmplt'
+
+        def handler(e):
+            try:
+                # reset buffer if idle
+                now = time.time()
+                if now - float(getattr(self, '_tmplt_last_ts', 0.0)) > 2.0:
+                    self._tmplt_buffer = ''
+                self._tmplt_last_ts = now
+
+                name = str(getattr(e, 'name', '') or '')
+                if len(name) == 1 and name.isprintable():
+                    self._tmplt_buffer += name.lower()
+                    self._tmplt_buffer = self._tmplt_buffer[-40:]
+                elif name in ('space', 'enter', 'tab'):
+                    # word boundary; check before adding boundary
+                    if self._tmplt_buffer.endswith(trigger):
+                        # Remove trigger text in active app (best-effort)
+                        try:
+                            for _ in range(len(trigger)):
+                                _kbd.send('backspace')
+                        except Exception:
+                            pass
+                        # open selector
+                        self.after(0, self._open_tmplt_overlay)
+                    self._tmplt_buffer = ''
+                elif name in ('backspace',):
+                    self._tmplt_buffer = self._tmplt_buffer[:-1]
+                else:
+                    # punctuation boundary
+                    if self._tmplt_buffer.endswith(trigger):
+                        try:
+                            for _ in range(len(trigger)):
+                                _kbd.send('backspace')
+                        except Exception:
+                            pass
+                        self.after(0, self._open_tmplt_overlay)
+                    self._tmplt_buffer = ''
+            except Exception:
+                pass
+
+        try:
+            self._tmplt_hook = _kbd.on_press(handler)
+        except Exception:
+            self._tmplt_hook = None
+
+    def _cursor_pos(self):
+        try:
+            pt = ctypes.wintypes.POINT()  # type: ignore
+            ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))  # type: ignore
+            return int(pt.x), int(pt.y)
+        except Exception:
+            try:
+                return int(self.winfo_pointerx()), int(self.winfo_pointery())
+            except Exception:
+                return 200, 200
+
+    def _open_tmplt_overlay(self):
+        if not self._adv('adv_snippets'):
+            return
+        self._ensure_default_snippets()
+        dlg = tk.Toplevel(self)
+        dlg.title('Insert Template')
+        dlg.transient(self)
+        dlg.resizable(False, False)
+        try:
+            dlg.attributes('-topmost', True)
+        except Exception:
+            pass
+
+        x, y = self._cursor_pos()
+        dlg.geometry(f"420x340+{x}+{y}")
+
+        frm = ttk.Frame(dlg, padding=10)
+        frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frm, text='Search templates').pack(anchor='w')
+        q = tk.StringVar(value='')
+        ent = ttk.Entry(frm, textvariable=q)
+        ent.pack(fill=tk.X, pady=(6, 8))
+
+        lst = tk.Listbox(frm, height=10, exportselection=False)
+        lst.pack(fill=tk.BOTH, expand=True)
+
+        hint = ttk.Label(frm, text='Enter to insert • Esc to close', font=('Segoe UI', 9))
+        hint.pack(anchor='w', pady=(8, 0))
+
+        state = {'items': []}
+
+        def filtered():
+            qq = (q.get() or '').strip().lower()
+            out = []
+            for t in getattr(self, 'snippets', []) or []:
+                name = str(t.get('name') or '')
+                grp = str(t.get('group') or '')
+                body = str(t.get('body') or '')
+                if not qq or qq in name.lower() or qq in grp.lower() or qq in body.lower():
+                    out.append(t)
+            return out
+
+        def refresh():
+            items = filtered()
+            state['items'] = items
+            lst.delete(0, tk.END)
+            for t in items:
+                name = str(t.get('name') or 'Unnamed')
+                grp = str(t.get('group') or '')
+                prefix = f"[{grp}] " if grp else ''
+                lst.insert(tk.END, prefix + name)
+            if items:
+                lst.selection_set(0)
+
+        def do_insert(_evt=None):
+            try:
+                i = int(lst.curselection()[0])
+            except Exception:
+                return
+            t = state['items'][i]
+            self._paste_text_to_active_app(str(t.get('body') or ''))
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+
+        def do_close(_evt=None):
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+
+        q.trace_add('write', lambda *_: refresh())
+        lst.bind('<Return>', do_insert)
+        lst.bind('<Double-Button-1>', do_insert)
+        dlg.bind('<Escape>', do_close)
+        ent.bind('<Return>', do_insert)
+        refresh()
+        ent.focus_set()
+
+    # ----- Images & screenshots -----
+    def _save_images_meta(self):
+        try:
+            self._store_save_json(self.images_meta_path, getattr(self, 'images', []))
+        except Exception:
+            pass
+
+    def _clipboard_get_image(self):
+        if ImageGrab is None:
+            return None
+        try:
+            data = ImageGrab.grabclipboard()
+            if data is None:
+                return None
+            if Image is not None and isinstance(data, Image.Image):
+                return data
+            return None
+        except Exception:
+            return None
+
+    def _image_signature(self, img) -> str:
+        try:
+            import io
+            buf = io.BytesIO()
+            img.save(buf, format='PNG')
+            b = buf.getvalue()
+            return hashlib.sha256(b).hexdigest()
+        except Exception:
+            return ''
+
+    def _add_image_from_pil(self, img):
+        if not self._adv('adv_images'):
+            return
+        try:
+            self.images_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        sig = self._image_signature(img)
+        if not sig or sig == getattr(self, '_last_image_sig', ''):
+            return
+        self._last_image_sig = sig
+
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        rid = secrets.token_hex(4)
+        fname = f"img_{ts}_{rid}.png"
+        fpath = self.images_dir / fname
+        try:
+            img.save(str(fpath), format='PNG')
+        except Exception:
+            return
+
+
+        # Encrypt image-on-disk if Encrypt-All is enabled (Option A uses PIN)
+        try:
+            if self._enc_all_enabled() and getattr(self, '_session_pin', None) and Fernet is not None:
+                from pathlib import Path as _P
+                b = _P(str(fpath)).read_bytes()
+                env = self._encrypt_image_bytes(b, self._session_pin, ext='png')
+                enc_path = self.images_dir / f"img_{ts}_{rid}.c2img"
+                enc_path.write_text(json.dumps(env, ensure_ascii=False, indent=2), encoding='utf-8')
+                try:
+                    _P(str(fpath)).unlink()
+                except Exception:
+                    try:
+                        os.remove(str(fpath))
+                    except Exception:
+                        pass
+                fpath = enc_path
+        except Exception:
+            pass
+
+        rec = {
+            'id': f"{ts}_{rid}",
+            'path': str(fpath),
+            'created_at': now_ts(),
+        }
+        if not isinstance(getattr(self, 'images', None), list):
+            self.images = []
+        self.images.append(rec)
+        self._save_images_meta()
+
+        # If currently in Images view, refresh list
+        try:
+            if hasattr(self, 'filter_var') and str(self.filter_var.get()) == 'img':
+                self._refresh_list(select_last=True)
+        except Exception:
+            pass
+
+    def _capture_screenshot(self):
+        if not self._adv('adv_screenshots'):
+            messagebox.showinfo(APP_NAME, 'Enable Screenshots under Settings → Advanced Features.')
+            return
+        if ImageGrab is None:
+            messagebox.showerror(APP_NAME, 'Screenshots require Pillow (PIL).')
+            return
+        try:
+            img = ImageGrab.grab()
+            self._add_image_from_pil(img)
+            # Switch to Images view so the user can immediately see the result
+            try:
+                if hasattr(self, 'filter_var'):
+                    self.filter_var.set('img')
+                self._refresh_list(select_last=True)
+            except Exception:
+                pass
+            self.status_var.set(f"Screenshot captured — {now_ts()}")
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"Screenshot failed\n{e}")
+
+    def _open_images_folder(self):
+        try:
+            self.images_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        try:
+            os.startfile(str(self.images_dir))  # type: ignore
+        except Exception:
+            try:
+                webbrowser.open(str(self.images_dir))
+            except Exception:
+                pass
+
+    def _open_data_folder(self):
+        """Open the app's data directory (AppData folder used by Copy2)."""
+        try:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        try:
+            os.startfile(str(self.data_dir))  # type: ignore
+        except Exception:
+            try:
+                webbrowser.open(str(self.data_dir))
+            except Exception:
+                pass
+
+    def _clipboard_set_image(self, pil_img) -> bool:
+        """Copy a PIL image to the Windows clipboard (CF_DIB).
+
+        Falls back to False on non-Windows platforms.
+        """
+        if pil_img is None:
+            return False
+        if os.name != 'nt':
+            return False
+        try:
+            import io
+            img = pil_img.convert('RGB')
+            output = io.BytesIO()
+            # BMP includes a 14-byte file header; CF_DF_DIB expects the DIB payload.
+            img.save(output, 'BMP')
+            data = output.getvalue()[14:]
+            output.close()
+
+            GMEM_MOVEABLE = 0x0002
+            CF_DIB = 8
+
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+
+            if not user32.OpenClipboard(None):
+                return False
+            try:
+                user32.EmptyClipboard()
+                hglob = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+                if not hglob:
+                    return False
+                lp = kernel32.GlobalLock(hglob)
+                if not lp:
+                    return False
+                ctypes.memmove(lp, data, len(data))
+                kernel32.GlobalUnlock(hglob)
+                if not user32.SetClipboardData(CF_DIB, hglob):
+                    return False
+                # On success, the clipboard owns the memory handle.
+                return True
+            finally:
+                user32.CloseClipboard()
+        except Exception:
+            return False
+
+    def _copy_selected_image(self, rec: dict | None) -> bool:
+        """Copy selected image to clipboard; fall back to copying file path as text."""
+        if not rec:
+            return False
+        path = str(rec.get('path') or '').strip()
+        if not path:
+            return False
+
+        try:
+            if Image is not None:
+                import io
+                b = self._load_image_bytes(rec)
+                if b is None:
+                    raise RuntimeError("no image bytes")
+                img = Image.open(io.BytesIO(b))
+                if self._clipboard_set_image(img):
+                    return True
+        except Exception:
+            pass
+
+        # Fallback: copy file path
+        try:
+            return bool(self._clipboard_set_text(path))
+        except Exception:
+            return False
 
     def _log_check(self, msg: str):
         try:
@@ -696,17 +1697,543 @@ class Copy2AppBase:
         except Exception:
             pass
 
+    
+
+    # -----------------------------
+    # Data folder + encryption helpers
+    # -----------------------------
+    _ENC_MAGIC = "__copy2_enc__"
+    _ENC_V = 1
+
+    def _open_data_folder(self):
+        """Open the app data directory in Explorer."""
+        try:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        try:
+            os.startfile(str(self.data_dir))  # type: ignore
+        except Exception:
+            try:
+                webbrowser.open(str(self.data_dir))
+            except Exception:
+                pass
+
+    def _enc_all_enabled(self) -> bool:
+        """True when 'Encrypt ALL local data files' is active and crypto is available."""
+        try:
+            if not (getattr(self.settings, 'advanced_features', False) and getattr(self.settings, 'adv_encrypt_all_data', False)):
+                return False
+            if Fernet is None:
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _startup_requires_unlock(self) -> bool:
+        """Startup requires unlock when App Lock is on OR local encryption is on, and a PIN exists."""
+        try:
+            if not getattr(self.settings, 'advanced_features', False):
+                return False
+            need = bool(getattr(self.settings, 'adv_app_lock', False) or getattr(self.settings, 'adv_encrypt_all_data', False))
+            return bool(need and self._pin_is_set())
+        except Exception:
+            return False
+
+    
+
+    # -----------------------------
+    # UI-only Lock Overlay (no modal dialogs, no withdraw/iconify)
+    # -----------------------------
+    def _require_unlocked(self, feature_name: str = "") -> bool:
+        """Gate UI-only features while locked. Engine (clipboard polling) must continue."""
+        try:
+            if getattr(self, '_unlocked', True):
+                return True
+        except Exception:
+            return True
+        try:
+            self._show_lock_overlay(reason=(feature_name or "Locked"))
+        except Exception:
+            pass
+        return False
+
+    def _apply_startup_lock_overlay(self):
+        """Apply startup lock if App Lock and/or Encrypt-All requires it.
+
+        This does not block app launch and does not stop clipboard polling.
+        """
+        try:
+            if self._startup_requires_unlock():
+                self._unlocked = False
+                self._show_lock_overlay(reason="Locked")
+            else:
+                self._unlocked = True
+                self._hide_lock_overlay()
+        except Exception:
+            # Fail open visually, but do not break launch
+            try:
+                self._hide_lock_overlay()
+            except Exception:
+                pass
+
+    def _ensure_lock_overlay(self):
+        if getattr(self, '_lock_overlay', None) is not None:
+            return
+
+        # Use plain Tk widgets for maximum compatibility (works under ttkbootstrap too)
+        ov = tk.Frame(self)
+        try:
+            # If ttkbootstrap is active, use theme colors when possible
+            colors = getattr(self, 'style', None).colors if getattr(self, 'style', None) is not None else None
+            if colors is not None:
+                ov.configure(bg=colors.bg)
+        except Exception:
+            pass
+
+        # Center card
+        card = tk.Frame(ov)
+        try:
+            colors = getattr(self, 'style', None).colors if getattr(self, 'style', None) is not None else None
+            if colors is not None:
+                card.configure(bg=colors.bg)
+        except Exception:
+            pass
+        card.place(relx=0.5, rely=0.5, anchor='center')
+
+        # Branding
+        title = tk.Label(card, text="Copy 2.0", font=("Segoe UI", 22, "bold"))
+        subtitle = tk.Label(card, text="Enter PIN to unlock", font=("Segoe UI", 11))
+        try:
+            colors = getattr(self, 'style', None).colors if getattr(self, 'style', None) is not None else None
+            if colors is not None:
+                title.configure(bg=colors.bg, fg=colors.fg)
+                subtitle.configure(bg=colors.bg, fg=colors.fg)
+        except Exception:
+            pass
+        title.pack(padx=24, pady=(18, 6))
+        subtitle.pack(padx=24, pady=(0, 14))
+
+        # PIN entry
+        pin_var = tk.StringVar(value="")
+        ent = tk.Entry(card, textvariable=pin_var, show='*', width=28, font=("Segoe UI", 12))
+        ent.pack(padx=24, pady=(0, 10))
+
+        # Error line
+        err_var = tk.StringVar(value="")
+        err = tk.Label(card, textvariable=err_var, font=("Segoe UI", 10))
+        try:
+            colors = getattr(self, 'style', None).colors if getattr(self, 'style', None) is not None else None
+            if colors is not None:
+                err.configure(bg=colors.bg, fg=colors.danger)
+        except Exception:
+            pass
+        err.pack(padx=24, pady=(0, 8))
+
+        # Unlock button (no Cancel)
+        btn = tk.Button(card, text="Unlock", command=lambda: self._attempt_unlock_from_overlay(pin_var, err_var))
+        btn.pack(padx=24, pady=(6, 18), fill='x')
+
+        # Bind Enter to unlock
+        try:
+            ent.bind('<Return>', lambda e: (self._attempt_unlock_from_overlay(pin_var, err_var), 'break'))
+        except Exception:
+            pass
+
+        self._lock_overlay = ov
+        self._lock_pin_var = pin_var
+        self._lock_err_var = err_var
+        self._lock_entry = ent
+
+    def _show_lock_overlay(self, reason: str = "Locked"):
+        self._ensure_lock_overlay()
+        try:
+            if getattr(self, '_lock_err_var', None) is not None:
+                self._lock_err_var.set("")
+        except Exception:
+            pass
+
+        # Cover the full client area; blocks interaction with underlying UI
+        try:
+            self._lock_overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+        except Exception:
+            try:
+                self._lock_overlay.pack(fill='both', expand=True)
+            except Exception:
+                pass
+
+        # Focus PIN field
+        try:
+            self._lock_entry.focus_set()
+            self._lock_entry.icursor('end')
+        except Exception:
+            pass
+
+    def _hide_lock_overlay(self):
+        ov = getattr(self, '_lock_overlay', None)
+        if ov is None:
+            return
+        try:
+            ov.place_forget()
+        except Exception:
+            pass
+        try:
+            ov.pack_forget()
+        except Exception:
+            pass
+
+    def _attempt_unlock_from_overlay(self, pin_var: tk.StringVar, err_var: tk.StringVar):
+        pin = ''
+        try:
+            pin = str(pin_var.get() or '').strip()
+        except Exception:
+            pin = ''
+
+        if not pin:
+            try:
+                err_var.set('PIN required')
+            except Exception:
+                pass
+            try:
+                self._lock_entry.focus_set()
+            except Exception:
+                pass
+            return
+
+        if not self._verify_pin_value(pin):
+            try:
+                err_var.set('Incorrect PIN')
+                pin_var.set('')
+            except Exception:
+                pass
+            try:
+                self._lock_entry.focus_set()
+            except Exception:
+                pass
+            return
+
+        # Success
+        try:
+            self._session_pin = pin
+        except Exception:
+            pass
+        try:
+            self._unlocked = True
+            self._pin_session_verified = True
+        except Exception:
+            pass
+
+        # If encrypted stores were deferred, load them now
+        try:
+            if not bool(getattr(self, '_stores_loaded', True)):
+                self._load_persisted_state()
+                self._stores_loaded = True
+
+                # Merge any items captured while locked
+                pending = list(getattr(self, '_captured_while_locked', []) or [])
+                if pending:
+                    for t in pending:
+                        try:
+                            if isinstance(t, str) and t and t not in self.history:
+                                self.history.append(t)
+                        except Exception:
+                            pass
+                    try:
+                        self._captured_while_locked.clear()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        try:
+            self._refresh_list(select_last=True)
+        except Exception:
+            pass
+
+        self._hide_lock_overlay()
+
+    def _kdf_fernet_key(self, pin: str, salt: bytes, iters: int = 200_000) -> bytes:
+        import base64
+        try:
+            if PBKDF2HMAC is None or hashes is None:
+                raise RuntimeError("PBKDF2 unavailable")
+            kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=iters)
+            key = kdf.derive(pin.encode('utf-8'))
+            return base64.urlsafe_b64encode(key)
+        except Exception:
+            # Last-resort fallback (weak): deterministic SHA256
+            import hashlib
+            key = hashlib.sha256((pin + salt.hex()).encode('utf-8')).digest()[:32]
+            return base64.urlsafe_b64encode(key)
+
+    def _encrypt_json_obj(self, obj: object, pin: str) -> dict:
+        import base64
+        salt = secrets.token_bytes(16)
+        iters = 200_000
+        key = self._kdf_fernet_key(pin, salt, iters)
+        f = Fernet(key)
+        payload = json.dumps(obj, ensure_ascii=False).encode('utf-8')
+        token = f.encrypt(payload)
+        return {
+            self._ENC_MAGIC: self._ENC_V,
+            "salt_b64": base64.b64encode(salt).decode('ascii'),
+            "iters": iters,
+            "token": token.decode('ascii'),
+        }
+
+    def _decrypt_json_obj(self, env: dict, pin: str):
+        import base64
+        salt = base64.b64decode(str(env.get('salt_b64') or ''))
+        iters = int(env.get('iters') or 200_000)
+        token = str(env.get('token') or '').encode('ascii')
+        key = self._kdf_fernet_key(pin, salt, iters)
+        f = Fernet(key)
+        raw = f.decrypt(token)
+        return json.loads(raw.decode('utf-8'))
+
+    def _encrypt_image_bytes(self, blob: bytes, pin: str, ext: str = 'png') -> dict:
+        """Encrypt raw image bytes into a Copy2 envelope (stored on disk as JSON)."""
+        import base64
+        try:
+            data_b64 = base64.b64encode(blob).decode('ascii')
+        except Exception:
+            data_b64 = ''
+        return self._encrypt_json_obj({"data_b64": data_b64, "ext": ext}, pin)
+
+    def _store_load_json(self, p: Path, default):
+        """Load JSON, supporting Copy2 encrypted envelopes when encrypt-all is enabled."""
+        try:
+            if not p.exists():
+                return default
+            txt = p.read_text(encoding='utf-8', errors='ignore')
+            data = json.loads(txt)
+        except Exception:
+            return default
+
+        # Encrypted envelope
+        try:
+            if isinstance(data, dict) and data.get(self._ENC_MAGIC) == self._ENC_V:
+                pin = getattr(self, '_session_pin', None)
+                if not pin:
+                    return default
+                try:
+                    return self._decrypt_json_obj(data, pin)
+                except Exception:
+                    return default
+        except Exception:
+            pass
+
+        return data if data is not None else default
+
+    def _store_save_json(self, p: Path, obj: object):
+        """Save JSON, encrypting when encrypt-all is enabled and a session PIN is present."""
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        if self._enc_all_enabled():
+            pin = getattr(self, '_session_pin', None)
+            if pin:
+                try:
+                    env = self._encrypt_json_obj(obj, pin)
+                    p.write_text(json.dumps(env, ensure_ascii=False, indent=2), encoding='utf-8')
+                    return
+                except Exception:
+                    pass
+
+        # Plaintext fallback
+        try:
+            p.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception:
+            pass
+
+    def _load_image_bytes(self, rec: dict) -> bytes | None:
+        """Load raw image bytes, supporting encrypted .c2img files."""
+        try:
+            path = str(rec.get('path') or '').strip()
+            if not path or not os.path.exists(path):
+                return None
+            if path.lower().endswith('.c2img'):
+                if Fernet is None:
+                    return None
+                pin = getattr(self, '_session_pin', None)
+                if not pin:
+                    return None
+                raw_env = json.loads(Path(path).read_text(encoding='utf-8', errors='ignore'))
+                if not (isinstance(raw_env, dict) and raw_env.get(self._ENC_MAGIC) == self._ENC_V):
+                    return None
+                data = self._decrypt_json_obj(raw_env, pin)
+                if isinstance(data, dict) and 'data_b64' in data:
+                    import base64
+                    return base64.b64decode(data['data_b64'])
+                return None
+            # Plain image
+            return Path(path).read_bytes()
+        except Exception:
+            return None
+
+    def _migrate_image_files_for_encrypt_all(self, encrypt: bool):
+        """Convert existing image files between plain PNG/JPG and encrypted .c2img files.
+
+        This is best-effort. It updates `self.images` records in-place.
+        """
+        try:
+            if not getattr(self, 'images', None):
+                return
+            if Fernet is None:
+                return
+            pin = getattr(self, '_session_pin', None)
+            if not pin:
+                return
+
+            for rec in list(self.images):
+                try:
+                    path = str(rec.get('path') or '').strip()
+                    if not path:
+                        continue
+                    p = Path(path)
+                    if not p.exists():
+                        continue
+
+                    if encrypt:
+                        if p.suffix.lower() == '.c2img':
+                            rec['enc'] = True
+                            continue
+                        raw = p.read_bytes()
+                        ext = (rec.get('ext') or p.suffix.lstrip('.').lower() or 'png')
+                        env = self._encrypt_image_bytes(raw, pin, ext=str(ext))
+                        outp = p.with_suffix('.c2img')
+                        outp.write_text(json.dumps(env, ensure_ascii=False, indent=2), encoding='utf-8')
+                        try:
+                            p.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        rec['path'] = str(outp)
+                        rec['enc'] = True
+                        rec['ext'] = ext
+                    else:
+                        # Decrypt
+                        if p.suffix.lower() != '.c2img':
+                            rec['enc'] = False
+                            continue
+                        raw_env = json.loads(p.read_text(encoding='utf-8', errors='ignore'))
+                        if not (isinstance(raw_env, dict) and raw_env.get(self._ENC_MAGIC) == self._ENC_V):
+                            continue
+                        data = self._decrypt_json_obj(raw_env, pin)
+                        if not isinstance(data, dict) or 'data_b64' not in data:
+                            continue
+                        ext = str(data.get('ext') or rec.get('ext') or 'png')
+                        raw = base64.b64decode(str(data.get('data_b64') or ''))
+                        outp = p.with_suffix('.' + ext)
+                        outp.write_bytes(raw)
+                        try:
+                            p.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        rec['path'] = str(outp)
+                        rec['enc'] = False
+                        rec['ext'] = ext
+                except Exception:
+                    continue
+        except Exception:
+            return
+
+    def _image_key_for_rec(self, rec: dict, fallback_i: int = 0) -> str:
+        rid = str(rec.get('id') or '').strip()
+        if rid:
+            return f"IMG::{rid}"
+        p = str(rec.get('path') or '').strip()
+        base = os.path.basename(p) if p else str(fallback_i)
+        return f"IMG::{base}"
+
+    def _enforce_startup_security(self) -> bool:
+        """Deprecated: startup security is now enforced via a UI-only lock overlay.
+
+        This method is kept for backward compatibility with older init flows.
+        It must never hide/withdraw the root or block the clipboard engine.
+        """
+        try:
+            self.after(0, self._apply_startup_lock_overlay)
+        except Exception:
+            pass
+        return True
+
+    def _load_persisted_state(self):
+        """(Re)load persisted state using store helpers (supports encrypted stores)."""
+        # History
+        try:
+            hist = self._store_load_json(self.history_path, [])
+            self.history = deque([x for x in (hist or []) if isinstance(x, str) and x.strip()], maxlen=self.settings.max_history)
+        except Exception:
+            pass
+        # Lists/dicts
+        try:
+            self.favorites = list(self._store_load_json(self.favs_path, []))
+        except Exception:
+            self.favorites = []
+        try:
+            self.pins = list(self._store_load_json(self.pins_path, []))
+        except Exception:
+            self.pins = []
+        try:
+            self.tags = self._store_load_json(self.tags_path, {}) or {}
+        except Exception:
+            self.tags = {}
+        try:
+            self.tag_colors = self._store_load_json(self.tag_colors_path, {}) or {}
+        except Exception:
+            self.tag_colors = {}
+        try:
+            self.expiry = self._store_load_json(self.expiry_path, {}) or {}
+        except Exception:
+            self.expiry = {}
+        try:
+            meta = self._store_load_json(self.images_meta_path, [])
+            self.images = meta if isinstance(meta, list) else []
+        except Exception:
+            self.images = []
+        try:
+            sn = self._store_load_json(self.snippets_path, {'templates': []})
+            self.snippets = sn.get('templates', []) if isinstance(sn, dict) else []
+        except Exception:
+            self.snippets = []
+
     def _persist(self):
-        # Always persist settings (UI/theme/hotkeys should survive restarts).
+        """Persist settings and state. When Encrypt-All is enabled, sensitive stores are encrypted."""
+        # Always persist settings (plaintext; required to know whether encryption/lock are enabled).
         safe_json_save(self.settings_path, asdict(self.settings))
+
+        # Security data must remain plaintext (PIN verification depends on it).
+        try:
+            safe_json_save(self.security_path, getattr(self, 'security', {}))
+        except Exception:
+            pass
+
+        # If Encrypt-All is enabled, never write store files unless a verified session PIN is present.
+        # This prevents overwriting encrypted JSON envelopes with plaintext defaults while locked.
+        try:
+            if self._enc_all_enabled() and not getattr(self, '_session_pin', None):
+                return
+        except Exception:
+            pass
+
+        # Advanced feature stores (encrypt-all applies here too)
+        try:
+            self._store_save_json(self.snippets_path, {'templates': getattr(self, 'snippets', [])})
+            self._store_save_json(self.images_meta_path, getattr(self, 'images', []))
+        except Exception:
+            pass
+
         if self.settings.session_only:
             return
-        safe_json_save(self.history_path, list(self.history))
-        safe_json_save(self.favs_path, list(self.favorites))
-        safe_json_save(self.pins_path, list(self.pins))
-        safe_json_save(self.tags_path, self.tags)
-        safe_json_save(self.tag_colors_path, getattr(self, "tag_colors", {}))
-        safe_json_save(self.expiry_path, self.expiry)
+
+        self._store_save_json(self.history_path, list(self.history))
+        self._store_save_json(self.favs_path, list(self.favorites))
+        self._store_save_json(self.pins_path, list(self.pins))
+        self._store_save_json(self.tags_path, self.tags)
+        self._store_save_json(self.tag_colors_path, getattr(self, "tag_colors", {}))
+        self._store_save_json(self.expiry_path, self.expiry)
 
 
     # -----------------------------
@@ -1082,7 +2609,16 @@ class Copy2AppBase:
         if len(items) <= capacity:
             return items, True
 
+        # Protected items: Favorites, Pins, and anything with a Tag.
         keep = set(self.favorites) | set(self.pins)
+        try:
+            keep |= {k for k in (self.tags or {}).keys() if not str(k).startswith('IMG::')}
+        except Exception:
+            pass
+        try:
+            keep |= set((self.tags or {}).keys())
+        except Exception:
+            pass
 
         # Remove from the front (oldest) while over capacity, skipping Favorites/Pins
         i = 0
@@ -1140,6 +2676,7 @@ class Copy2AppBase:
     # Clipboard polling
     # -----------------------------
     def _poll_clipboard(self):
+        """Poll clipboard for new text (and optional images) and append to history."""
         try:
             # Expiry housekeeping (throttled)
             try:
@@ -1148,15 +2685,39 @@ class Copy2AppBase:
                     self._last_expiry_purge = time.time()
             except Exception:
                 pass
+
             if not self.paused:
+
+                # Note: Lock is UI-only. Clipboard capture must continue while locked.
+
+                # Optional: capture clipboard images
+                try:
+                    if self._adv('adv_images') and (bool(getattr(self, '_stores_loaded', True)) or not self._enc_all_enabled()):
+                        img = self._clipboard_get_image()
+                        if img is not None:
+                            self._add_image_from_pil(img)
+                except Exception:
+                    pass
+
                 text = self._clipboard_get_text()
                 if isinstance(text, str):
                     text = text.strip("\r\n")
                 else:
                     text = ""
+
                 if text and text != self.last_clip:
                     self.last_clip = text
-                    self._add_history_item(text)
+                    # If Encrypt-All stores are deferred (locked at startup), keep capturing but buffer in memory
+                    try:
+                        if not bool(getattr(self, '_stores_loaded', True)):
+                            try:
+                                self._captured_while_locked.append(text)
+                            except Exception:
+                                pass
+                        else:
+                            self._add_history_item(text)
+                    except Exception:
+                        self._add_history_item(text)
         except Exception:
             pass
 
@@ -1182,11 +2743,28 @@ class Copy2AppBase:
         pruned, ok = self._prune_preserving_favorites(items, cap)
 
         if not ok:
-            # Favorites exceed capacity -> block adding the new item
-            # Keep history unchanged, do not overwrite favorites.
-            self._notify_favorites_blocking()
+            # Favorites/Pins exceed capacity; auto-expand capacity (up to hard cap) to avoid breaking capture.
+            try:
+                protected = set(self.favorites) | set(self.pins)
+                try:
+                    protected |= {k for k in (self.tags or {}).keys() if not str(k).startswith('IMG::')}
+                except Exception:
+                    pass
+                need = len(protected) + 5
+                if need > self.settings.max_history:
+                    self.settings.max_history = min(HARD_MAX_HISTORY, max(self.settings.max_history, need))
+                    # Try again with the expanded cap
+                    cap = self.settings.max_history
+                    pruned, ok = self._prune_preserving_favorites(items, cap)
+                    if ok:
+                        self.history = deque(pruned[-cap:], maxlen=cap)
+                        self._refresh_list(select_last=True)
+                        self._persist()
+                        return
+            except Exception:
+                pass
 
-            # If they are already at hard cap, give stronger warning.
+            self._notify_favorites_blocking()
             if self.settings.max_history >= HARD_MAX_HISTORY:
                 self._notify_hard_cap_reached()
             return
@@ -1233,7 +2811,11 @@ class Copy2AppBase:
     # -----------------------------
     # List/view helpers
     # -----------------------------
-    def _format_list_item(self, item: str) -> str:
+    def _format_list_item(self, item: str, display_index: int | None = None) -> str:
+        """Format a history text item for the Listbox.
+
+        display_index is the 1-based ordinal in the current view (used for line-number-like numbering).
+        """
         one = re.sub(r"\s+", " ", item).strip()
         if len(one) > 90:
             one = one[:87] + "..."
@@ -1243,8 +2825,29 @@ class Copy2AppBase:
         fav_mark = FAV_ICON if item in self.favorites else " "
         tag_mark = TAG_ICON if self.tags.get(item) else " "
 
-        prefix = f"{pin_mark}{fav_mark}{tag_mark} "
+        idx = f"{display_index:>4} | " if isinstance(display_index, int) and display_index > 0 else ""
+        prefix = f"{idx}{pin_mark}{fav_mark}{tag_mark} "
         return prefix + one
+
+    def _format_list_item_image(self, key: str, rec: dict, display_index: int | None = None) -> str:
+        """Format an image record for the Listbox (Images / mixed views)."""
+        try:
+            p = str(rec.get('path') or '')
+            name = os.path.basename(p) if p else '(image)'
+            ts = str(rec.get('created_at') or '')
+            label = f"{IMAGE_ICON} {name}"
+            if ts:
+                label = f"{label}  —  {ts}"
+        except Exception:
+            label = f"{IMAGE_ICON} (image)"
+
+        pin_mark = PIN_ICON if key in self.pins else ' ' 
+        fav_mark = FAV_ICON if key in self.favorites else ' ' 
+        tag_mark = TAG_ICON if self.tags.get(key) else ' ' 
+
+        idx = f"{display_index:>4} | " if isinstance(display_index, int) and display_index > 0 else ''
+        prefix = f"{idx}{pin_mark}{fav_mark}{tag_mark} "
+        return prefix + label
 
     def _current_filter(self) -> str:
         if hasattr(self, "filter_var") and self.filter_var is not None:
@@ -1302,57 +2905,101 @@ class Copy2AppBase:
         except Exception:
             pass
         self._refresh_list(select_last=True)
+
     def _refresh_list(self, select_last: bool = False):
-        # Preserve current selection (by value) across refreshes unless select_last is requested
-        preserve_texts = []
+        """Refresh the left Listbox according to the current filter.
+
+        Supports mixed views (text + images) for Favorites / Pins / Tags, and
+        preserves selection across refreshes when possible.
+        """
+        # Keep the tag dropdown up-to-date
+        try:
+            self._refresh_tag_filter_values()
+        except Exception:
+            pass
+
+        # Preserve current selection values (by item key/text)
+        preserve = []
         try:
             for i in self.listbox.curselection():
                 if 0 <= i < len(getattr(self, 'view_items', [])):
-                    preserve_texts.append(self.view_items[i])
+                    preserve.append(self.view_items[i])
         except Exception:
-            preserve_texts = []
+            preserve = []
 
-        if not preserve_texts:
+        if not preserve:
             try:
-                preserve_texts = list(getattr(self, '_last_selected_texts', []) or [])
+                preserve = list(getattr(self, '_last_selected_texts', []) or [])
             except Exception:
-                preserve_texts = []
-            if not preserve_texts and getattr(self, '_selected_item_text', None):
-                preserve_texts = [self._selected_item_text]
+                preserve = []
+            if (not preserve) and getattr(self, '_selected_item_text', None):
+                preserve = [self._selected_item_text]
 
-        items = list(self.history)
         f = self._current_filter()
-        if f == "fav":
-            items = [x for x in items if x in self.favorites]
-        elif f == "pin":
-            items = [x for x in items if x in self.pins]
-        elif f == "tag":
-            tag = ""
+
+        # Build a stable global image-key map for mixed views
+        self._image_map_all = {}
+        try:
+            for i, rec in enumerate(list(getattr(self, 'images', []) or [])):
+                k = self._image_key_for_rec(rec, i)
+                if k in self._image_map_all:
+                    k = f"{k}::{i}"
+                self._image_map_all[k] = rec
+        except Exception:
+            self._image_map_all = {}
+
+        # Resolve base items for the filter
+        items = []
+        if f == 'img':
+            self._image_map = dict(self._image_map_all)
+            items = list(self._image_map.keys())
+        elif f == 'fav':
+            favs = list(getattr(self, 'favorites', []) or [])
+            items = [x for x in favs if (x in self.history) or (x in self._image_map_all)]
+        elif f == 'pin':
+            pins = list(getattr(self, 'pins', []) or [])
+            items = [x for x in pins if (x in self.history) or (x in self._image_map_all)]
+        elif f == 'tag':
             try:
                 tag = str(self.tag_filter_var.get()).strip()
             except Exception:
-                tag = ""
+                tag = ''
             if tag:
-                items = [x for x in items if tag in self.tags.get(x, [])]
+                text_items = [x for x in list(self.history) if tag in self.tags.get(x, [])]
+                img_items = [k for k in self._image_map_all.keys() if tag in self.tags.get(k, [])]
+                items = text_items + img_items
+            else:
+                items = list(self.history)
+        else:
+            items = list(self.history)
 
-        # Pinned items always float to the top (within the current filter)
-        if items:
-            pins = [x for x in items if x in self.pins]
-            rest = [x for x in items if x not in self.pins]
-            items = pins + rest
+        # Pinned items float to the top for all filters except the dedicated Pin view
+        try:
+            if f != 'pin':
+                pinned = [x for x in (getattr(self, 'pins', []) or []) if x in items]
+                pinned_set = set(pinned)
+                rest = [x for x in items if x not in pinned_set]
+                items = pinned + rest
+        except Exception:
+            pass
 
         self.view_items = items
 
+        # Render
         self.listbox.delete(0, tk.END)
-        for idx, item in enumerate(self.view_items):
-            self.listbox.insert(tk.END, self._format_list_item(item))
+        for idx0, item in enumerate(self.view_items):
+            if self._is_image_key(item):
+                rec = self._image_map_all.get(item, {})
+                self.listbox.insert(tk.END, self._format_list_item_image(item, rec, idx0 + 1))
+            else:
+                self.listbox.insert(tk.END, self._format_list_item(item, idx0 + 1))
 
-            # Tag color (first matching tag with a configured color)
+            # Apply tag color (first matching tag with a configured color)
             try:
                 for tg in self.tags.get(item, []):
                     col = getattr(self, 'tag_colors', {}).get(tg)
                     if isinstance(col, str) and col.strip():
-                        self.listbox.itemconfig(idx, fg=col.strip())
+                        self.listbox.itemconfig(idx0, fg=col.strip())
                         break
             except Exception:
                 pass
@@ -1361,48 +3008,80 @@ class Copy2AppBase:
         self._prev_sel_set = set()
         self._sel_order = []
 
+        # Restore selection
         if select_last and self.view_items:
-            self.listbox.selection_clear(0, tk.END)
-            self.listbox.selection_set(tk.END)
-            self.listbox.see(tk.END)
-            self._on_select()
-        else:
-            # Restore previous selection (do not trigger _on_select unless selection is empty)
-            if preserve_texts:
-                try:
-                    self.listbox.selection_clear(0, tk.END)
-                    restored = []
-                    for t in preserve_texts:
-                        if t in self.view_items:
-                            i = self.view_items.index(t)
-                            self.listbox.selection_set(i)
-                            restored.append(i)
-                    if restored:
-                        self.listbox.see(restored[0])
-                        self._prev_sel_set = set(restored)
-                        self._sel_order = list(restored)
-                except Exception:
-                    pass
+            try:
+                self.listbox.selection_clear(0, tk.END)
+                self.listbox.selection_set(tk.END)
+                self.listbox.see(tk.END)
+            except Exception:
+                pass
+        elif preserve:
+            try:
+                self.listbox.selection_clear(0, tk.END)
+                restored = []
+                for t in preserve:
+                    if t in self.view_items:
+                        i = self.view_items.index(t)
+                        self.listbox.selection_set(i)
+                        restored.append(i)
+                if restored:
+                    self.listbox.see(restored[0])
+                    self._prev_sel_set = set(restored)
+                    self._sel_order = list(restored)
+            except Exception:
+                pass
+
+        # Update preview for selection
+        try:
+            if self.listbox.curselection():
+                self._on_select()
+        except Exception:
+            pass
 
         try:
             self._update_status_bar()
         except Exception:
-            self.status_var.set(
-                f"v{APP_VERSION}   Items: {len(self.history)}   Favorites: {len(self.favorites)}   Pins: {len(self.pins)}   Data: {self.data_dir}"
-            )
+            pass
+
 
 
     def _get_selected_indices(self) -> list[int]:
         return list(self.listbox.curselection())
 
-    def _get_selected_text(self) -> str | None:
+    def _is_image_key(self, key) -> bool:
+        try:
+            if not (isinstance(key, str) and key.startswith('IMG::')):
+                return False
+            return key in (getattr(self, '_image_map_all', {}) or {})
+        except Exception:
+            return False
+
+    def _get_selected_item(self):
+        """Return a tuple: (kind, payload) where kind in {'text','image'}.
+
+        - For text: payload is the text value (str)
+        - For image: payload is the image record (dict) or None
+        """
         sel = self._get_selected_indices()
         if not sel:
-            return None
+            return (None, None)
         i = sel[0]
-        if i < 0 or i >= len(self.view_items):
+        if i < 0 or i >= len(getattr(self, 'view_items', [])):
+            return (None, None)
+        key = self.view_items[i]
+        if self._is_image_key(key):
+            try:
+                return ('image', getattr(self, '_image_map_all', {}).get(key))
+            except Exception:
+                return ('image', None)
+        return ('text', key)
+
+    def _get_selected_text(self) -> str | None:
+        kind, payload = self._get_selected_item()
+        if kind != 'text':
             return None
-        return self.view_items[i]
+        return payload
 
     def _apply_reverse_lines(self, text: str) -> str:
         lines = text.splitlines()
@@ -1423,8 +3102,113 @@ class Copy2AppBase:
         self._preview_dirty = not mark_clean
         self._update_preview_dirty_ui()
 
+        # Update line numbers gutter (if present)
+        try:
+            self._update_preview_line_numbers()
+        except Exception:
+            pass
+
         if self.search_query:
             self._highlight_query_in_preview(self.search_query)
+
+    def _update_preview_line_numbers(self):
+        """Render 1-based line numbers next to the Preview Text widget."""
+        if not hasattr(self, 'preview_gutter') or self.preview_gutter is None:
+            return
+        try:
+            # Determine number of lines (end-1c avoids trailing newline)
+            end_index = self.preview.index('end-1c')
+            lines = int(str(end_index).split('.')[0])
+        except Exception:
+            lines = 1
+
+        nums = "\n".join(str(i) for i in range(1, max(1, lines) + 1)) + "\n"
+        try:
+            self.preview_gutter.configure(state='normal')
+            self.preview_gutter.delete('1.0', tk.END)
+            self.preview_gutter.insert('1.0', nums)
+            self.preview_gutter.configure(state='disabled')
+        except Exception:
+            pass
+
+        # Keep gutter scrolled in sync with preview
+        try:
+            first, _last = self.preview.yview()
+            self.preview_gutter.yview_moveto(first)
+        except Exception:
+            pass
+
+    def _show_text_preview(self):
+        """Show the text preview frame (and hide the image preview frame)."""
+        try:
+            if hasattr(self, 'preview_image_frame') and self.preview_image_frame is not None:
+                self.preview_image_frame.grid_remove()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'preview_text_frame') and self.preview_text_frame is not None:
+                self.preview_text_frame.grid()
+        except Exception:
+            pass
+
+    def _show_image_preview(self, rec: dict | None):
+        """Show an image record in the preview pane."""
+        # Hide text editor UI
+        try:
+            if hasattr(self, 'preview_text_frame') and self.preview_text_frame is not None:
+                self.preview_text_frame.grid_remove()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'preview_image_frame') and self.preview_image_frame is not None:
+                self.preview_image_frame.grid()
+        except Exception:
+            return
+
+        if not rec:
+            try:
+                self.image_preview_title.configure(text='(No image selected)')
+                self.image_preview_label.configure(image='', text='')
+            except Exception:
+                pass
+            return
+
+        path = str(rec.get('path') or '').strip()
+        title = os.path.basename(path) if path else '(image)'
+        try:
+            self.image_preview_title.configure(text=title)
+        except Exception:
+            pass
+
+        if not path or not os.path.exists(path):
+            try:
+                self.image_preview_label.configure(text='Image file not found.', image='')
+            except Exception:
+                pass
+            return
+
+        # Load & scale the image to the available preview area
+        try:
+            import io
+            b = self._load_image_bytes(rec)
+            if b is None:
+                raise RuntimeError("no image bytes")
+            img = Image.open(io.BytesIO(b))
+            # Determine target size
+            self.preview_container.update_idletasks()
+            w = int(self.preview_container.winfo_width() or 800)
+            h = int(self.preview_container.winfo_height() or 600)
+            # Leave room for title + padding
+            h = max(100, h - 60)
+            w = max(100, w - 40)
+            img.thumbnail((w, h))
+            self._img_preview_tk = ImageTk.PhotoImage(img)
+            self.image_preview_label.configure(image=self._img_preview_tk, text='')
+        except Exception:
+            try:
+                self.image_preview_label.configure(text='Could not render image preview.', image='')
+            except Exception:
+                pass
 
     def _on_select(self):
         if self._preview_dirty and self._selected_item_text is not None:
@@ -1441,12 +3225,23 @@ class Copy2AppBase:
             else:
                 self._revert_preview_edits()
 
-        t = self._get_selected_text()
-        if not t:
+        kind, payload = self._get_selected_item()
+        if not kind:
             self._selected_item_text = None
+            self._show_text_preview()
             self._set_preview_text("", mark_clean=True)
             return
 
+        if kind == 'image':
+            self._selected_item_text = None
+            try:
+                self.reverse_var.set(False)
+            except Exception:
+                pass
+            self._show_image_preview(payload)
+            return
+
+        t = str(payload)
         self._selected_item_text = t
 
         # Keep reverse-lines checkbox in sync with the selected item
@@ -1455,6 +3250,7 @@ class Copy2AppBase:
         except Exception:
             pass
         display = self._get_preview_display_text_for_item(t)
+        self._show_text_preview()
         self._set_preview_text(display, mark_clean=True)
 
         if self.search_query:
@@ -1565,6 +3361,12 @@ class Copy2AppBase:
             self._preview_dirty = (current != baseline)
         self._update_preview_dirty_ui()
 
+        # Keep line numbers up to date while editing
+        try:
+            self._update_preview_line_numbers()
+        except Exception:
+            pass
+
         if self.search_query:
             self._highlight_query_in_preview(self.search_query)
 
@@ -1627,7 +3429,29 @@ class Copy2AppBase:
         self.status_var.set(f"Reverted edits — {now_ts()}")
 
     def _copy_selected(self):
-        out = self.preview.get("1.0", tk.END).rstrip("\n")
+        # If an image is selected in the Images view, copy that image (or its path as a fallback).
+        kind, payload = self._get_selected_item()
+        if kind == 'image':
+            ok = self._copy_selected_image(payload)
+            if ok:
+                try:
+                    self.status_var.set(f"Copied image — {now_ts()}")
+                except Exception:
+                    pass
+            else:
+                messagebox.showerror(APP_NAME, "Failed to copy image to clipboard.")
+            return
+
+        # Text: if the user has selected a range in Preview, copy only that range.
+        try:
+            if self.preview.tag_ranges('sel'):
+                out = self.preview.get('sel.first', 'sel.last')
+            else:
+                out = self.preview.get("1.0", tk.END)
+        except Exception:
+            out = self.preview.get("1.0", tk.END)
+
+        out = (out or '').rstrip("\n")
         if not out.strip():
             return
         if self._clipboard_set_text(out):
@@ -1639,6 +3463,47 @@ class Copy2AppBase:
             messagebox.showerror(APP_NAME, "Failed to copy to clipboard.")
 
     def _delete_selected(self):
+        kind, payload = self._get_selected_item()
+        if kind == 'image':
+            rec = payload
+            if not rec:
+                return
+            if not messagebox.askyesno(APP_NAME, "Delete selected image from the list?\n\n(Note: this will also attempt to delete the image file.)"):
+                return
+            try:
+                path = str(rec.get('path') or '').strip()
+            except Exception:
+                path = ''
+
+            key = self._image_key_for_rec(rec)
+            try:
+                if key in self.favorites:
+                    self.favorites = [x for x in self.favorites if x != key]
+                if key in self.pins:
+                    self.pins = [x for x in self.pins if x != key]
+                self.tags.pop(key, None)
+                self.expiry.pop(key, None)
+            except Exception:
+                pass
+
+            try:
+                self.images = [r for r in (getattr(self, 'images', []) or []) if r is not rec and r.get('id') != rec.get('id')]
+                self._save_images_meta()
+            except Exception:
+                pass
+            try:
+                if path and os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+
+            try:
+                if hasattr(self, 'filter_var') and str(self.filter_var.get()) == 'img':
+                    self._refresh_list(select_last=True)
+            except Exception:
+                pass
+            return
+
         t = self._get_selected_text()
         if not t:
             return
@@ -1663,33 +3528,94 @@ class Copy2AppBase:
         self._persist()
 
     def _clean_keep_favorites(self):
+        """Clean action.
+
+        Requirement:
+        - NOTHING that has a Favorite, Pin, or ANY Tag should be removed.
+        - Images follow the same rule.
         """
-        Clean action: remove all NON-favorites, keep favorites.
-        This matches your requirement: favorites stay behind after cleaning.
-        """
-        if not messagebox.askyesno(APP_NAME, "Clean history and keep Favorites/Pins only?"):
+        if not messagebox.askyesno(APP_NAME, "Clean history and keep Favorites/Pins/Tagged items?\n\nAnything with a tag, pin, or favorite will be preserved."):
             return
 
+        # Protected keys: favorites, pins, and any key that has at least one tag.
         keep = set(self.favorites) | set(self.pins)
-        kept = [x for x in self.history if x in keep]
+        try:
+            keep |= {k for k, v in (self.tags or {}).items() if isinstance(v, list) and len(v) > 0}
+        except Exception:
+            pass
 
+        # Text history: keep only protected items (favorites/pins/tagged)
+        kept = [x for x in self.history if x in keep]
         self.history = deque(kept, maxlen=self.settings.max_history)
+
+        # Images: keep only protected; remove files + metadata + tag/expiry refs for removed images
+        try:
+            new_images = []
+            for i, rec in enumerate(list(getattr(self, 'images', []) or [])):
+                k = self._image_key_for_rec(rec, i)
+                if k in keep:
+                    new_images.append(rec)
+                else:
+                    # Remove file on disk
+                    try:
+                        p = str(rec.get('path') or '').strip()
+                        if p and os.path.exists(p):
+                            os.remove(p)
+                    except Exception:
+                        pass
+                    # Remove metadata pointers for removed item only
+                    try:
+                        self.tags.pop(k, None)
+                        self.expiry.pop(k, None)
+                    except Exception:
+                        pass
+                    try:
+                        if k in self.favorites:
+                            self.favorites = [x for x in self.favorites if x != k]
+                        if k in self.pins:
+                            self.pins = [x for x in self.pins if x != k]
+                    except Exception:
+                        pass
+
+            self.images = new_images
+            self._save_images_meta()
+        except Exception:
+            pass
+
+        # Remove tag/expiry entries for text items that no longer exist in history
+        try:
+            alive_text = set(self.history)
+            for k in list((self.tags or {}).keys()):
+                if str(k).startswith('IMG::'):
+                    continue
+                if k not in alive_text and k not in keep:
+                    self.tags.pop(k, None)
+                    self.expiry.pop(k, None)
+        except Exception:
+            pass
 
         self._selected_item_text = None
         self._set_preview_text("", mark_clean=True)
         self._refresh_list(select_last=True)
         self._persist()
-        self.status_var.set(f"Cleaned (kept favorites/pins) — {now_ts()}")
+        self.status_var.set(f"Cleaned (kept favorites/pins/tagged) — {now_ts()}")
 
     def _toggle_favorite_selected(self):
-        t = self._get_selected_text()
-        if not t:
+        sel = self._get_selected_indices()
+        if not sel:
+            return
+        items = [self.view_items[i] for i in sel if 0 <= i < len(self.view_items)]
+        if not items:
             return
 
-        if t in self.favorites:
-            self.favorites = [x for x in self.favorites if x != t]
+        any_unfav = any(it not in self.favorites for it in items)
+        if any_unfav:
+            for it in items:
+                if it not in self.favorites:
+                    self.favorites.append(it)
         else:
-            self.favorites.append(t)
+            remove_set = set(items)
+            self.favorites = [x for x in self.favorites if x not in remove_set]
 
         self._refresh_list()
         self._persist()
@@ -1940,6 +3866,8 @@ class Copy2AppBase:
 
     def _open_quick_paste(self):
         """Keyboard-first quick paste/typing palette."""
+        if not self._require_unlocked('Quick Paste'):
+            return
         win = tk.Toplevel(self)
         win.title('Quick Paste')
         win.attributes('-topmost', True)
@@ -2396,7 +4324,13 @@ class Copy2AppBase:
 
 
     def _search_live(self, _event=None):
-        """Live search feedback while typing (does not jump selection)."""
+        """Live search feedback while typing.
+
+        Enhancements:
+        - Searches text history AND image items
+        - Matches against tags (both text and image keys)
+        - Keeps results as item keys so jump works for images too
+        """
         try:
             q = str(self.search_var.get()).strip()
         except Exception:
@@ -2416,25 +4350,70 @@ class Copy2AppBase:
             self.search_index = 0
             return
 
-        matches = []
         ql = q.lower()
+
+        # Ensure image map exists (so images can be searched even when not in Images view)
+        try:
+            if not hasattr(self, '_image_map_all'):
+                self._refresh_list()
+        except Exception:
+            pass
+
+        matches = []
+
+        # Text items
         for item in list(self.history):
             try:
-                if ql in item.lower() or self._fuzzy_match(q, item):
+                itl = item.lower()
+                if ql in itl or self._fuzzy_match(q, item):
                     matches.append(item)
+                    continue
+                # Tag match
+                for tg in self.tags.get(item, []) or []:
+                    if isinstance(tg, str) and ql in tg.lower():
+                        matches.append(item)
+                        break
             except Exception:
                 pass
-        self.search_matches = matches
+
+        # Image keys
+        try:
+            for k, rec in (getattr(self, '_image_map_all', {}) or {}).items():
+                try:
+                    name = ''
+                    if isinstance(rec, dict):
+                        name = str(rec.get('id') or '') + ' ' + os.path.basename(str(rec.get('path') or ''))
+                    if ql and name and ql in name.lower():
+                        matches.append(k)
+                        continue
+                    for tg in self.tags.get(k, []) or []:
+                        if isinstance(tg, str) and ql in tg.lower():
+                            matches.append(k)
+                            break
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # De-dupe while preserving order
+        seen=set()
+        out=[]
+        for x in matches:
+            if x not in seen:
+                out.append(x)
+                seen.add(x)
+
+        self.search_matches = out
         self.search_index = 0
 
-        # Highlight in preview (all occurrences of the raw query)
+        # Highlight in preview
         try:
             self._highlight_query_in_preview(q)
         except Exception:
             pass
 
         try:
-            self._set_status_note(f"Search: {len(matches)} match(es)")
+            self._set_status_note(f"Search: {len(out)} match(es)")
         except Exception:
             pass
 
@@ -2445,31 +4424,73 @@ class Copy2AppBase:
         self.search_index = 0
 
         if not q:
-            self.status_var.set("Search cleared.")
+            self.status_var.set('Search cleared.')
             try:
-                self.preview.tag_remove("match", "1.0", tk.END)
+                self.preview.tag_remove('match', '1.0', tk.END)
             except Exception:
                 pass
             return
 
-        # Match against full history using substring OR loose fuzzy (in-order chars)
         ql = q.lower()
-        for item in list(self.history):
-            if ql in item.lower() or self._fuzzy_match(q, item):
-                self.search_matches.append(item)
 
-        if not self.search_matches:
-            self.status_var.set(f"No matches for: {q}")
+        # Ensure image map exists
+        try:
+            if not hasattr(self, '_image_map_all'):
+                self._refresh_list()
+        except Exception:
+            pass
+
+        matches = []
+
+        # Text history matches
+        for item in list(self.history):
             try:
-                self.preview.tag_remove("match", "1.0", tk.END)
+                if ql in item.lower() or self._fuzzy_match(q, item):
+                    matches.append(item)
+                    continue
+                for tg in self.tags.get(item, []) or []:
+                    if isinstance(tg, str) and ql in tg.lower():
+                        matches.append(item)
+                        break
+            except Exception:
+                pass
+
+        # Image matches (by id/filename or by tag)
+        try:
+            for k, rec in (getattr(self, '_image_map_all', {}) or {}).items():
+                try:
+                    name = ''
+                    if isinstance(rec, dict):
+                        name = str(rec.get('id') or '') + ' ' + os.path.basename(str(rec.get('path') or ''))
+                    if name and ql in name.lower():
+                        matches.append(k)
+                        continue
+                    for tg in self.tags.get(k, []) or []:
+                        if isinstance(tg, str) and ql in tg.lower():
+                            matches.append(k)
+                            break
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # De-dupe
+        seen=set(); out=[]
+        for x in matches:
+            if x not in seen:
+                out.append(x); seen.add(x)
+
+        if not out:
+            self.status_var.set(f'No matches for: {q}')
+            try:
+                self.preview.tag_remove('match', '1.0', tk.END)
             except Exception:
                 pass
             return
 
-        self.status_var.set(f"Found {len(self.search_matches)} matches for: {q}")
-        self._jump_to_item(self.search_matches[0], highlight_query=q)
-
-
+        self.search_matches = out
+        self.status_var.set(f'Found {len(out)} matches for: {q}')
+        self._jump_to_item(out[0], highlight_query=q)
 
     def _jump_match(self, direction: int):
         if not self.search_matches:
@@ -2478,10 +4499,24 @@ class Copy2AppBase:
         self.search_index = (self.search_index + direction) % len(self.search_matches)
         self._jump_to_item(self.search_matches[self.search_index], highlight_query=self.search_query)
 
-    def _jump_to_item(self, item_text: str, highlight_query: str = ""):
-        if item_text not in self.view_items and self._current_filter() != "all":
+    def _jump_to_item(self, item_text: str, highlight_query: str = ''):
+        # If this is an image key, ensure we're in a view that can show images
+        try:
+            if self._is_image_key(item_text):
+                if self._current_filter() != 'img':
+                    try:
+                        self.filter_var.set('img')
+                    except Exception:
+                        pass
+                    self._refresh_list()
+        except Exception:
+            pass
+
+        if item_text not in self.view_items and self._current_filter() != 'all':
             try:
-                self.filter_var.set("all")
+                # Fallback to all for text items
+                if not self._is_image_key(item_text):
+                    self.filter_var.set('all')
             except Exception:
                 pass
             self._refresh_list()
@@ -2495,18 +4530,31 @@ class Copy2AppBase:
         self.listbox.see(idx)
 
         self._selected_item_text = item_text
-        display = self._get_preview_display_text_for_item(item_text)
-        self._set_preview_text(display, mark_clean=True)
+
+        # Preview: text shows text; images show thumbnail + metadata
+        try:
+            if self._is_image_key(item_text):
+                kind, rec = self._get_selected_item()
+                if kind == 'image' and isinstance(rec, dict):
+                    self._show_image_in_preview(rec)
+                else:
+                    self._set_preview_text('(Image could not be loaded)', mark_clean=True)
+            else:
+                display = self._get_preview_display_text_for_item(item_text)
+                self._set_preview_text(display, mark_clean=True)
+        except Exception:
+            try:
+                display = self._get_preview_display_text_for_item(item_text)
+                self._set_preview_text(display, mark_clean=True)
+            except Exception:
+                pass
 
         if highlight_query:
             self._highlight_query_in_preview(highlight_query)
 
-    # -----------------------------
-    # Import / Export (verified, stable)
-    # -----------------------------
     def _export(self):
         path = filedialog.asksaveasfilename(
-            title="Export History",
+            title="Export Data",
             defaultextension=".json",
             filetypes=[("JSON", "*.json")],
             initialfile="copy2_export.json",
@@ -2514,29 +4562,116 @@ class Copy2AppBase:
         if not path:
             return
 
-        data = {
+        payload = {
             "exported_at": now_ts(),
             "app_version": APP_VERSION,
             "history": list(self.history),
             "favorites": list(self.favorites),
+            "pins": list(self.pins),
+            "tags": dict(self.tags or {}),
+            "tag_colors": dict(getattr(self, 'tag_colors', {}) or {}),
+            "expiry": dict(getattr(self, 'expiry', {}) or {}),
             "settings": asdict(self.settings),
+            "snippets": list(getattr(self, 'snippets', []) or []),
+            "images": list(getattr(self, 'images', []) or []),
         }
+
+        # Embed image bytes (best-effort) so exports are self-contained
+        imgs_blob = []
         try:
-            Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            import base64
+            for rec in list(getattr(self, 'images', []) or []):
+                b = self._load_image_bytes(rec)
+                if b is None:
+                    continue
+                imgs_blob.append({
+                    'id': rec.get('id'),
+                    'created_at': rec.get('created_at'),
+                    'name': os.path.basename(str(rec.get('path') or '')),
+                    'data_b64': base64.b64encode(b).decode('ascii'),
+                })
+        except Exception:
+            imgs_blob = []
+        payload['images_blob'] = imgs_blob
+
+        out_obj = payload
+
+        # Encrypt export if Encrypt-Exports OR Encrypt-All is enabled.
+        try:
+            want_enc = bool(getattr(self.settings, 'advanced_features', False) and (getattr(self.settings, 'adv_encrypt_exports', False) or getattr(self.settings, 'adv_encrypt_all_data', False)))
+        except Exception:
+            want_enc = False
+
+        if want_enc:
+            if Fernet is None:
+                messagebox.showwarning(APP_NAME, 'Export encryption requires cryptography (Fernet). Exporting plaintext instead.')
+            else:
+                if not self._pin_is_set():
+                    messagebox.showerror(APP_NAME, 'Export encryption requires a PIN. Set a PIN under Settings → Advanced.')
+                    return
+                pin = getattr(self, '_session_pin', None)
+                if not pin:
+                    pin = simpledialog.askstring(APP_NAME, 'Enter PIN to encrypt export:', show='*')
+                    if not pin or not self._verify_pin_value(pin):
+                        messagebox.showerror(APP_NAME, 'Incorrect PIN. Export cancelled.')
+                        return
+                    self._session_pin = str(pin).strip()
+                out_obj = {
+                    '__copy2_export_enc__': 1,
+                    'env': self._encrypt_json_obj(payload, self._session_pin)
+                }
+
+        try:
+            Path(path).write_text(json.dumps(out_obj, ensure_ascii=False, indent=2), encoding="utf-8")
             self.status_var.set(f"Exported — {path}")
         except Exception as e:
             messagebox.showerror(APP_NAME, f"Export failed:\n{e}")
 
     def _import(self):
-        path = filedialog.askopenfilename(title="Import History", filetypes=[("JSON", "*.json")])
+        path = filedialog.askopenfilename(title="Import Data", filetypes=[("JSON", "*.json")])
         if not path:
             return
 
         try:
-            data = json.loads(Path(path).read_text(encoding="utf-8"))
-            history = data.get("history", [])
-            favorites = data.get("favorites", [])
+            raw = json.loads(Path(path).read_text(encoding="utf-8", errors='ignore'))
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"Import failed:\n{e}")
+            return
 
+        # Decrypt export envelope if needed
+        data = raw
+        try:
+            if isinstance(raw, dict) and raw.get('__copy2_export_enc__') == 1 and isinstance(raw.get('env'), dict):
+                if Fernet is None:
+                    messagebox.showerror(APP_NAME, 'This export is encrypted but cryptography (Fernet) is not available.')
+                    return
+                if not self._pin_is_set():
+                    messagebox.showerror(APP_NAME, 'This export is encrypted but no PIN is configured in this app instance.')
+                    return
+                pin = getattr(self, '_session_pin', None)
+                if not pin:
+                    pin = simpledialog.askstring(APP_NAME, 'Enter PIN to decrypt import:', show='*')
+                    if not pin or not self._verify_pin_value(pin):
+                        messagebox.showerror(APP_NAME, 'Incorrect PIN. Import cancelled.')
+                        return
+                    self._session_pin = str(pin).strip()
+                data = self._decrypt_json_obj(raw['env'], self._session_pin)
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"Import failed:\n{e}")
+            return
+
+        try:
+            history = data.get('history', []) if isinstance(data, dict) else []
+            favorites = data.get('favorites', []) if isinstance(data, dict) else []
+            pins = data.get('pins', []) if isinstance(data, dict) else []
+            tags = data.get('tags', {}) if isinstance(data, dict) else {}
+            tag_colors = data.get('tag_colors', {}) if isinstance(data, dict) else {}
+            expiry = data.get('expiry', {}) if isinstance(data, dict) else {}
+            snippets = data.get('snippets', []) if isinstance(data, dict) else []
+            images_meta = data.get('images', []) if isinstance(data, dict) else []
+            images_blob = data.get('images_blob', []) if isinstance(data, dict) else []
+
+            # Merge history
             merged = list(self.history)
             if isinstance(history, list):
                 for item in history:
@@ -2552,35 +4687,94 @@ class Copy2AppBase:
                     seen.add(item)
             out.reverse()
 
-            # merge favorites (unique)
+            # Merge favorites/pins
             if isinstance(favorites, list):
                 for x in favorites:
                     if isinstance(x, str) and x not in self.favorites:
                         self.favorites.append(x)
+            if isinstance(pins, list):
+                for x in pins:
+                    if isinstance(x, str) and x not in self.pins:
+                        self.pins.append(x)
 
+            # Merge tags/colors/expiry
+            if isinstance(tags, dict):
+                for k, v in tags.items():
+                    if isinstance(k, str) and isinstance(v, list):
+                        cur = self.tags.get(k, []) if isinstance(self.tags, dict) else []
+                        cur_set = set([t for t in cur if isinstance(t, str)])
+                        for t in v:
+                            if isinstance(t, str) and t not in cur_set:
+                                cur.append(t)
+                        self.tags[k] = cur
+            if isinstance(tag_colors, dict):
+                self.tag_colors.update({k: v for k, v in tag_colors.items() if isinstance(k, str) and isinstance(v, str)})
+            if isinstance(expiry, dict):
+                self.expiry.update({k: v for k, v in expiry.items() if isinstance(k, str)})
+
+            # Merge snippets
+            if isinstance(snippets, list):
+                self.snippets = list(snippets)
+
+            # Import images (prefer embedded blobs)
+            try:
+                import base64
+                self.images_dir.mkdir(parents=True, exist_ok=True)
+                existing_ids = set([str(r.get('id') or '') for r in (getattr(self, 'images', []) or [])])
+                for blob in images_blob:
+                    bid = str(blob.get('id') or '').strip()
+                    if not bid:
+                        continue
+                    if bid in existing_ids:
+                        continue
+                    b = base64.b64decode(str(blob.get('data_b64') or ''))
+                    fname = f"img_{bid}.png"
+                    fpath = self.images_dir / fname
+                    # Respect Encrypt-All
+                    if self._enc_all_enabled() and getattr(self, '_session_pin', None) and Fernet is not None:
+                        env = self._encrypt_json_obj({'data_b64': base64.b64encode(b).decode('ascii'), 'ext': 'png'}, self._session_pin)
+                        fpath = self.images_dir / f"img_{bid}.c2img"
+                        Path(fpath).write_text(json.dumps(env, ensure_ascii=False, indent=2), encoding='utf-8')
+                    else:
+                        Path(fpath).write_bytes(b)
+
+                    rec = {'id': bid, 'path': str(fpath), 'created_at': blob.get('created_at') or now_ts()}
+                    if not isinstance(getattr(self, 'images', None), list):
+                        self.images = []
+                    self.images.append(rec)
+            except Exception:
+                pass
+
+            # Fall back: merge image metadata if present
+            if isinstance(images_meta, list):
+                # Only add those not already present
+                existing = set([str(r.get('id') or '') for r in (getattr(self, 'images', []) or [])])
+                for r in images_meta:
+                    if not isinstance(r, dict):
+                        continue
+                    rid = str(r.get('id') or '').strip()
+                    if rid and rid in existing:
+                        continue
+                    self.images.append(r)
+
+            # Apply cap & prune preserving favorites/pins
             cap = self.settings.max_history
             pruned, ok = self._prune_preserving_favorites(out, cap)
             if not ok:
-                # If favorites exceed cap, keep only favorites that are present in the pruned list
                 self._notify_favorites_blocking()
-
             self.history = deque(pruned[-cap:], maxlen=cap)
 
+            self._save_images_meta()
             self._refresh_list(select_last=True)
             self._persist()
             self.status_var.set(f"Imported — {path}")
 
         except Exception as e:
             messagebox.showerror(APP_NAME, f"Import failed:\n{e}")
-
-    # -----------------------------
-    # Settings dialog (+ Controls section)
-    # -----------------------------
-
-    # -----------------------------
-    # Settings dialog (General / Hotkeys / Sync / Help)
-    # -----------------------------
+ 
     def _open_settings(self, initial_tab: str = "General"):
+        if not self._require_unlocked('Settings'):
+            return
         dlg = tk.Toplevel(self)
         dlg.title("Settings")
         dlg.transient(self)
@@ -2595,11 +4789,13 @@ class Copy2AppBase:
         tab_general = ttk.Frame(nb)
         tab_hotkeys = ttk.Frame(nb)
         tab_sync = ttk.Frame(nb)
+        tab_advanced = ttk.Frame(nb)
         tab_help = ttk.Frame(nb)
 
         nb.add(tab_general, text='General')
         nb.add(tab_hotkeys, text='Hotkeys')
         nb.add(tab_sync, text='Sync')
+        nb.add(tab_advanced, text='Advanced')
         nb.add(tab_help, text='Help')
 
         # -----------------
@@ -2633,11 +4829,14 @@ class Copy2AppBase:
         if not themes:
             themes = [getattr(self.settings, 'theme', 'flatly')]
 
-        ttk.Label(g, text="Theme:").grid(row=4, column=0, sticky='w', padx=10, pady=(10,6))
+        ttk.Button(g, text='Open Files Location', command=self._open_data_folder).grid(row=4, column=0, sticky='w', padx=10, pady=(10,6))
+        ttk.Label(g, text='(Opens the AppData folder where Copy 2.0 stores its JSON / image files)').grid(row=5, column=0, columnspan=2, sticky='w', padx=10, pady=(0,8))
+
+        ttk.Label(g, text="Theme:").grid(row=6, column=0, sticky='w', padx=10, pady=(10,6))
         cb_theme = ttk.Combobox(g, textvariable=theme_var, values=themes, width=22, state='readonly')
-        cb_theme.grid(row=4, column=1, sticky='w', padx=10, pady=(10,6))
+        cb_theme.grid(row=6, column=1, sticky='w', padx=10, pady=(10,6))
         if not USE_TTKB:
-            ttk.Label(g, text="(Install ttkbootstrap to enable theme switching)").grid(row=5, column=0, columnspan=2, sticky='w', padx=10, pady=(6,0))
+            ttk.Label(g, text="(Install ttkbootstrap to enable theme switching)").grid(row=7, column=0, columnspan=2, sticky='w', padx=10, pady=(6,0))
 
         # -----------------
         # Hotkeys tab
@@ -2677,6 +4876,90 @@ class Copy2AppBase:
 
         ttk.Label(s, text="Sync interval (sec):").grid(row=3, column=0, sticky='w', padx=10, pady=6)
         ttk.Entry(s, textvariable=sync_int_var, width=12).grid(row=3, column=1, sticky='w', padx=10, pady=6)
+
+        # -----------------
+        # Advanced tab
+        # -----------------
+        a = tab_advanced
+        for c in range(3):
+            a.columnconfigure(c, weight=(1 if c == 1 else 0))
+
+        adv_master_var = tk.BooleanVar(value=getattr(self.settings, 'advanced_features', False))
+        adv_lock_var = tk.BooleanVar(value=getattr(self.settings, 'adv_app_lock', False))
+        adv_boot_var = tk.BooleanVar(value=getattr(self.settings, 'adv_start_on_boot', False))
+        adv_encrypt_var = tk.BooleanVar(value=getattr(self.settings, 'adv_encrypt_exports', False))
+        adv_all_var = tk.BooleanVar(value=getattr(self.settings, 'adv_encrypt_all_data', False))
+        adv_images_var = tk.BooleanVar(value=getattr(self.settings, 'adv_images', False))
+        adv_ss_var = tk.BooleanVar(value=getattr(self.settings, 'adv_screenshots', False))
+        adv_snip_var = tk.BooleanVar(value=getattr(self.settings, 'adv_snippets', False))
+        adv_trig_var = tk.BooleanVar(value=getattr(self.settings, 'adv_tmplt_trigger', False))
+        trig_word_var = tk.StringVar(value=getattr(self.settings, 'tmplt_trigger_word', 'tmplt'))
+
+        master_cb = ttk.Checkbutton(a, text='Enable Advanced Features (required for any options below)', variable=adv_master_var)
+        master_cb.grid(row=0, column=0, columnspan=3, sticky='w', padx=10, pady=(12, 8))
+
+        row = 1
+        cb_lock = ttk.Checkbutton(a, text='App-level lock (PIN required on startup)', variable=adv_lock_var)
+        cb_lock.grid(row=row, column=0, columnspan=2, sticky='w', padx=10, pady=6)
+        btn_pin = ttk.Button(a, text='Set / Change PIN…', command=lambda: self._set_or_change_pin_flow(parent=dlg))
+        btn_pin.grid(row=row, column=2, sticky='e', padx=10, pady=6)
+        row += 1
+
+        cb_boot = ttk.Checkbutton(a, text='Start on boot (Windows)', variable=adv_boot_var)
+        cb_boot.grid(row=row, column=0, columnspan=3, sticky='w', padx=10, pady=6)
+        row += 1
+
+        cb_encrypt = ttk.Checkbutton(a, text='Encrypt exports (requires PIN / passphrase)', variable=adv_encrypt_var)
+        cb_encrypt.grid(row=row, column=0, columnspan=3, sticky='w', padx=10, pady=6)
+        row += 1
+
+        cb_all = ttk.Checkbutton(a, text='Encrypt ALL local saved data (history/pins/tags/images/snippets) — requires PIN', variable=adv_all_var)
+        cb_all.grid(row=row, column=0, columnspan=3, sticky='w', padx=10, pady=6)
+        row += 1
+
+        cb_images = ttk.Checkbutton(a, text='Capture images copied to clipboard', variable=adv_images_var)
+        cb_images.grid(row=row, column=0, columnspan=3, sticky='w', padx=10, pady=6)
+        row += 1
+
+        cb_ss = ttk.Checkbutton(a, text='Enable screenshots (store as images)', variable=adv_ss_var)
+        cb_ss.grid(row=row, column=0, columnspan=2, sticky='w', padx=10, pady=6)
+        btn_ss = ttk.Button(a, text='Capture Screenshot', command=self._capture_screenshot)
+        btn_ss.grid(row=row, column=2, sticky='e', padx=10, pady=6)
+        row += 1
+
+        cb_snip = ttk.Checkbutton(a, text='Snippets / templates', variable=adv_snip_var)
+        cb_snip.grid(row=row, column=0, columnspan=2, sticky='w', padx=10, pady=6)
+        btn_sn = ttk.Button(a, text='Manage Templates…', command=self._open_snippets_manager)
+        btn_sn.grid(row=row, column=2, sticky='e', padx=10, pady=6)
+        row += 1
+
+        cb_trig = ttk.Checkbutton(a, text='Enable template trigger while typing (shows picker)', variable=adv_trig_var)
+        cb_trig.grid(row=row, column=0, sticky='w', padx=10, pady=6)
+        lbl_trig = ttk.Label(a, text='Trigger word:')
+        lbl_trig.grid(row=row, column=1, sticky='e', padx=10, pady=6)
+        ent_trig = ttk.Entry(a, textvariable=trig_word_var, width=14)
+        ent_trig.grid(row=row, column=2, sticky='e', padx=10, pady=6)
+        row += 1
+
+        btn_open_img = ttk.Button(a, text='Open Images Folder', command=self._open_images_folder)
+        btn_open_img.grid(row=row, column=2, sticky='e', padx=10, pady=(18, 0))
+        lbl_img = ttk.Label(a, text='(Images and screenshots are stored here)')
+        lbl_img.grid(row=row, column=0, columnspan=2, sticky='w', padx=10, pady=(18, 0))
+
+        def _adv_controls_state(*_):
+            en = bool(adv_master_var.get())
+            st = 'normal' if en else 'disabled'
+            for w in a.winfo_children():
+                if w is master_cb:
+                    continue
+                try:
+                    w.configure(state=st)
+                except Exception:
+                    pass
+
+        adv_master_var.trace_add('write', _adv_controls_state)
+        _adv_controls_state()
+
 
         # -----------------
         # Help tab
@@ -2735,63 +5018,193 @@ class Copy2AppBase:
             except Exception:
                 pass
 
-        def save():
+        def apply_settings(final: bool = False):
+            """Apply settings immediately (autosave). If final=True, apply even if some fields are invalid."""
+            # Numeric fields: only commit when valid to avoid noisy popups while typing
             try:
-                mh = int(max_var.get().strip())
-                pm = int(poll_var.get().strip())
+                mh = int(str(max_var.get()).strip())
+                pm = int(str(poll_var.get()).strip())
             except Exception:
-                messagebox.showerror(APP_NAME, 'Please enter valid integers for Max history and Poll interval.')
-                return
+                if final:
+                    return
+                mh = None
+                pm = None
 
-            mh = max(5, min(HARD_MAX_HISTORY, mh))
-            pm = max(100, min(5000, pm))
+            if mh is not None:
+                mh = max(5, min(HARD_MAX_HISTORY, mh))
+                if mh >= HARD_MAX_HISTORY:
+                    try:
+                        self._notify_hard_cap_reached()
+                    except Exception:
+                        pass
+                self.settings.max_history = mh
 
-            if mh >= HARD_MAX_HISTORY:
-                self._notify_hard_cap_reached()
+            if pm is not None:
+                pm = max(100, min(5000, pm))
+                self.settings.poll_ms = pm
 
-            # Save settings
-            self.settings.max_history = mh
-            self.settings.poll_ms = pm
             self.settings.session_only = bool(sess_var.get())
             self.settings.check_updates_on_launch = bool(upd_var.get())
 
+            # Theme
             if USE_TTKB:
                 new_theme = str(theme_var.get()).strip() or 'flatly'
-                self.settings.theme = new_theme
-                _apply_theme_now(new_theme)
+                if getattr(self.settings, 'theme', '') != new_theme:
+                    self.settings.theme = new_theme
+                    _apply_theme_now(new_theme)
 
+            # Hotkeys
             self.settings.enable_global_hotkeys = bool(hk_en_var.get())
             self.settings.hotkey_quick_paste = str(hk_qp_var.get()).strip() or self.settings.hotkey_quick_paste
             self.settings.hotkey_paste_last = str(hk_pl_var.get()).strip() or self.settings.hotkey_paste_last
 
+            # Sync
             self.settings.sync_enabled = bool(sync_en_var.get())
             self.settings.sync_folder = str(sync_folder_var.get()).strip()
             try:
                 self.settings.sync_interval_sec = max(3, min(300, int(str(sync_int_var.get()).strip())))
             except Exception:
-                self.settings.sync_interval_sec = max(3, min(300, int(getattr(self.settings, 'sync_interval_sec', 10) or 10)))
+                pass
+
+            # Advanced
+            prev_master = bool(getattr(self.settings, 'advanced_features', False))
+            prev_encrypt_all = bool(getattr(self.settings, 'adv_encrypt_all_data', False))
+
+            self.settings.advanced_features = bool(adv_master_var.get())
+            if self.settings.advanced_features:
+                self.settings.adv_app_lock = bool(adv_lock_var.get())
+                self.settings.adv_start_on_boot = bool(adv_boot_var.get())
+                self.settings.adv_encrypt_exports = bool(adv_encrypt_var.get())
+                self.settings.adv_encrypt_all_data = bool(adv_all_var.get())
+                self.settings.adv_images = bool(adv_images_var.get())
+                self.settings.adv_screenshots = bool(adv_ss_var.get())
+                self.settings.adv_snippets = bool(adv_snip_var.get())
+                self.settings.adv_tmplt_trigger = bool(adv_trig_var.get())
+                tw = str(trig_word_var.get() or '').strip()
+                self.settings.tmplt_trigger_word = tw if tw else 'tmplt'
+            else:
+                # Turning off master disables all subordinate features
+                self.settings.adv_app_lock = False
+                self.settings.adv_start_on_boot = False
+                self.settings.adv_encrypt_exports = False
+                self.settings.adv_encrypt_all_data = False
+                self.settings.adv_images = False
+                self.settings.adv_screenshots = False
+                self.settings.adv_snippets = False
+                self.settings.adv_tmplt_trigger = False
+
+            # Enforce PIN requirement for lock/encryption
+            try:
+                if self.settings.advanced_features and (self.settings.adv_app_lock or self.settings.adv_encrypt_all_data):
+                    if not self._pin_is_set():
+                        if messagebox.askyesno(APP_NAME, "This feature requires a PIN.\n\nSet a PIN now?"):
+                            self._set_or_change_pin_flow(parent=dlg)
+                    if not self._pin_is_set():
+                        # Disable dependent flags
+                        self.settings.adv_app_lock = False
+                        self.settings.adv_encrypt_all_data = False
+                        adv_lock_var.set(False)
+                        adv_all_var.set(False)
+                        messagebox.showwarning(APP_NAME, 'Feature disabled because no PIN is set.')
+            except Exception:
+                pass
+
+            # Start on boot (apply immediately)
+            try:
+                self._set_start_on_boot(bool(self.settings.advanced_features and self.settings.adv_start_on_boot))
+            except Exception:
+                pass
+
+            # If encrypt-all changed, ensure we have session pin (prompt) and migrate stores best-effort.
+            try:
+                if prev_encrypt_all != bool(self.settings.advanced_features and self.settings.adv_encrypt_all_data):
+                    if Fernet is None:
+                        self.settings.adv_encrypt_all_data = False
+                        adv_all_var.set(False)
+                        messagebox.showwarning(APP_NAME, 'Encrypt-All requires cryptography (Fernet).')
+                    else:
+                        if not getattr(self, '_session_pin', None):
+                            # Ask for PIN once
+                            p = simpledialog.askstring(APP_NAME, 'Enter PIN to apply encryption changes:', show='*', parent=dlg)
+                            if not p or not self._verify_pin_value(p):
+                                messagebox.showerror(APP_NAME, 'Incorrect PIN. Encryption change was not applied.')
+                                self.settings.adv_encrypt_all_data = prev_encrypt_all
+                                adv_all_var.set(prev_encrypt_all)
+                            else:
+                                self._session_pin = str(p).strip()
+                        # Migrate image files and re-save stores using the new encryption setting
+                        try:
+                            self._migrate_image_files_for_encrypt_all(bool(self.settings.advanced_features and self.settings.adv_encrypt_all_data))
+                        except Exception:
+                            pass
+                        self._persist()
+            except Exception:
+                pass
+
+            # Re-bootstrap advanced hooks
+            try:
+                self._advanced_bootstrap()
+            except Exception:
+                pass
 
             # Apply history capacity (preserve favorites/pins)
-            items = list(self.history)
-            pruned, ok = self._prune_preserving_favorites(items, mh)
-            if not ok:
-                self._notify_favorites_blocking()
-            self.history = deque(pruned[-mh:], maxlen=mh)
+            try:
+                if mh is not None:
+                    items = list(self.history)
+                    pruned, ok = self._prune_preserving_favorites(items, mh)
+                    if not ok:
+                        self._notify_favorites_blocking()
+                    self.history = deque(pruned[-mh:], maxlen=mh)
+            except Exception:
+                pass
 
-            self._refresh_list(select_last=True)
+            try:
+                self._refresh_list(select_last=True)
+            except Exception:
+                pass
+
+            # Persist + runtime features
             self._persist()
+            try:
+                self._register_global_hotkeys()
+            except Exception:
+                pass
+            try:
+                self._start_sync_job()
+            except Exception:
+                pass
 
-            # Apply runtime features
-            self._register_global_hotkeys()
-            self._start_sync_job()
+        # Debounced autosave
+        _autosave_state = {'job': None, 'guard': False}
 
-            dlg.destroy()
+        def schedule_autosave(*_):
+            if _autosave_state['guard']:
+                return
+            try:
+                if _autosave_state['job'] is not None:
+                    dlg.after_cancel(_autosave_state['job'])
+            except Exception:
+                pass
+            _autosave_state['job'] = dlg.after(450, lambda: apply_settings(final=False))
 
-        ttk.Button(bottom, text='Cancel', command=dlg.destroy).pack(side=tk.RIGHT)
-        ttk.Button(bottom, text='Save', command=save).pack(side=tk.RIGHT, padx=(0,10))
+        # Wire traces
+        for v in [max_var, poll_var, sess_var, upd_var, theme_var,
+                  hk_en_var, hk_qp_var, hk_pl_var,
+                  sync_en_var, sync_folder_var, sync_int_var,
+                  adv_master_var, adv_lock_var, adv_boot_var, adv_encrypt_var, adv_all_var,
+                  adv_images_var, adv_ss_var, adv_snip_var, adv_trig_var, trig_word_var]:
+            try:
+                v.trace_add('write', schedule_autosave)
+            except Exception:
+                pass
+
+        # Apply once immediately to normalize and ensure defaults
+        schedule_autosave()
+
+        ttk.Button(bottom, text='Close', command=lambda: (apply_settings(final=True), dlg.destroy())).pack(side=tk.RIGHT)
 
         # Select initial tab
-        tab_map = {'general': 0, 'hotkeys': 1, 'sync': 2, 'help': 3}
+        tab_map = {'general': 0, 'hotkeys': 1, 'sync': 2, 'advanced': 3, 'help': 4}
         idx = tab_map.get(str(initial_tab or '').strip().lower(), 0)
         try:
             nb.select(idx)
@@ -2817,6 +5230,10 @@ class Copy2AppBase:
         self.menu.add_command(label="Combine Selected", command=self._combine_selected)
         self.menu.add_separator()
         self.menu.add_command(label="Quick Paste...", command=self._open_quick_paste)
+        self.menu.add_separator()
+        self.menu.add_command(label="Templates / Snippets...", command=self._open_snippets_manager)
+        self.menu.add_command(label="Capture Screenshot", command=self._capture_screenshot)
+        self.menu.add_command(label="Open Images Folder", command=self._open_images_folder)
 
         def popup(event):
             try:
@@ -3175,6 +5592,8 @@ if USE_TTKB:
             self.title(APP_NAME)
             self._init_state()
             self._apply_window_defaults()
+
+            # Build UI first. Locking is UI-only and applied as an overlay after launch.
             self._build_ui()
             self._bind_shortcuts()
             self._build_context_menu()
@@ -3184,12 +5603,17 @@ if USE_TTKB:
             self._register_global_hotkeys()
             self._start_sync_job()
 
+            # Start clipboard engine unconditionally (must continue while locked)
             self.after(250, self._poll_clipboard)
             self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+            # Apply startup lock overlay (UI-only; engine keeps running)
+            self.after(0, self._apply_startup_lock_overlay)
 
             # Auto-check updates on launch (non-blocking)
             if self.settings.check_updates_on_launch:
                 self.after(900, lambda: self._check_updates_async(prompt_if_new=True))
+
 
         def _apply_window_defaults(self):
             self.minsize(1100, 720)
@@ -3367,6 +5791,8 @@ if USE_TTKB:
             tb.Radiobutton(filters, text="Favorites", value="fav", variable=self.filter_var, command=self._refresh_list, bootstyle="toolbutton").pack(side=LEFT, padx=(0, 8))
             tb.Radiobutton(filters, text="Pinned", value="pin", variable=self.filter_var, command=self._refresh_list, bootstyle="toolbutton").pack(side=LEFT, padx=(0, 12))
 
+            tb.Radiobutton(filters, text="Images", value="img", variable=self.filter_var, command=self._refresh_list, bootstyle="toolbutton").pack(side=LEFT, padx=(0, 12))
+
             tb.Label(filters, text="Tag").pack(side=LEFT)
             self.tag_filter_var = tk.StringVar(value="")
             self.tag_combo = tb.Combobox(filters, textvariable=self.tag_filter_var, values=[""], width=18, state="readonly")
@@ -3492,7 +5918,26 @@ if USE_TTKB:
             btn_copy_prev.pack(side=RIGHT, padx=(0, 18))
             ToolTip(btn_copy_prev, 'Copy (Ctrl+C)')
 
-            self.preview = tk.Text(right, wrap="word", undo=True)
+            # Preview container supports both text preview (with line numbers) and image preview.
+            self.preview_container = tb.Frame(right)
+            self.preview_container.grid(row=1, column=0, columnspan=2, sticky="nsew")
+            self.preview_container.rowconfigure(0, weight=1)
+            self.preview_container.columnconfigure(0, weight=1)
+
+            # --- Text preview (with line numbers gutter)
+            self.preview_text_frame = tb.Frame(self.preview_container)
+            self.preview_text_frame.grid(row=0, column=0, sticky="nsew")
+            self.preview_text_frame.rowconfigure(0, weight=1)
+            self.preview_text_frame.columnconfigure(1, weight=1)
+
+            self.preview_gutter = tk.Text(self.preview_text_frame, width=6, padx=6, pady=6, wrap='none', state='disabled')
+            self.preview_gutter.grid(row=0, column=0, sticky='ns')
+            try:
+                self.preview_gutter.configure(takefocus=0, cursor='arrow')
+            except Exception:
+                pass
+
+            self.preview = tk.Text(self.preview_text_frame, wrap="word", undo=True)
             # Improve readability (Text is not ttk-themed by default)
             try:
                 prev_font = ("Segoe UI", 11)
@@ -3504,17 +5949,65 @@ if USE_TTKB:
                         fg=colors.fg,
                         insertbackground=colors.fg,
                     )
+                    # Make gutter visually subtle
+                    try:
+                        self.preview_gutter.configure(font=prev_font, bg=colors.bg, fg=colors.fg)
+                    except Exception:
+                        pass
                 else:
                     self.preview.configure(font=prev_font)
+                    try:
+                        self.preview_gutter.configure(font=prev_font)
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
-            self.preview.grid(row=1, column=0, sticky="nsew")
-            self.preview.bind("<KeyRelease>", self._mark_preview_dirty)
+            self.preview.grid(row=0, column=1, sticky="nsew")
 
-            sb2 = tb.Scrollbar(right, orient="vertical", command=self.preview.yview)
-            sb2.grid(row=1, column=1, sticky="ns")
-            self.preview.configure(yscrollcommand=sb2.set)
+            def _preview_yview(*args):
+                try:
+                    self.preview.yview(*args)
+                    self.preview_gutter.yview(*args)
+                except Exception:
+                    pass
+
+            sb2 = tb.Scrollbar(self.preview_text_frame, orient="vertical", command=_preview_yview)
+            sb2.grid(row=0, column=2, sticky="ns")
+
+            def _yscroll(first, last):
+                try:
+                    sb2.set(first, last)
+                except Exception:
+                    pass
+                try:
+                    self.preview_gutter.yview_moveto(first)
+                except Exception:
+                    pass
+
+            self.preview.configure(yscrollcommand=_yscroll)
+            # Note: do not set yscrollcommand on the gutter to avoid recursion;
+            # we drive its scroll position from the main Preview Text widget.
+
+            self.preview.bind("<KeyRelease>", self._mark_preview_dirty)
+            self.preview.bind("<MouseWheel>", lambda e: (self.preview.yview_scroll(int(-1*(e.delta/120)), "units"), self.preview_gutter.yview_scroll(int(-1*(e.delta/120)), "units"), 'break'))
+
+            # --- Image preview
+            self.preview_image_frame = tb.Frame(self.preview_container)
+            self.preview_image_frame.grid(row=0, column=0, sticky='nsew')
+            self.preview_image_frame.rowconfigure(1, weight=1)
+            self.preview_image_frame.columnconfigure(0, weight=1)
+
+            self.image_preview_title = tb.Label(self.preview_image_frame, text='', anchor='w')
+            self.image_preview_title.grid(row=0, column=0, sticky='ew', padx=6, pady=(6, 0))
+            self.image_preview_label = tb.Label(self.preview_image_frame)
+            self.image_preview_label.grid(row=1, column=0, sticky='nsew', padx=6, pady=6)
+
+            # Start with text preview visible
+            try:
+                self.preview_image_frame.grid_remove()
+            except Exception:
+                pass
 
             # Bottom status bar
             bottom = tb.Frame(root)
@@ -3578,6 +6071,7 @@ else:
             self._init_state()
             self.minsize(1100, 720)
 
+            # Build UI first. Locking is UI-only and applied as an overlay after launch.
             self._build_ui()
             self._bind_shortcuts()
             self._build_context_menu()
@@ -3585,15 +6079,20 @@ else:
 
             # Optional: global hotkeys (Windows; requires 'keyboard')
             self._register_global_hotkeys()
-            
+
             # Optional: sync folder (basic pull/push)
             self._start_sync_job()
 
+            # Start clipboard engine unconditionally (must continue while locked)
             self.after(250, self._poll_clipboard)
             self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+            # Apply startup lock overlay (UI-only; engine keeps running)
+            self.after(0, self._apply_startup_lock_overlay)
+
             if self.settings.check_updates_on_launch:
                 self.after(900, lambda: self._check_updates_async(prompt_if_new=True))
+
 
         def _build_ui(self):
             from tkinter import ttk
@@ -3640,6 +6139,24 @@ def main():
     # Selftest for updater BAT: if this runs, Python DLLs loaded successfully.
     if "--copy2-selftest" in sys.argv:
         sys.exit(0)
+
+    # Prevent duplicate instances (fixes double-startup and PIN lock crashes)
+    try:
+        if os.name == 'nt':
+            import ctypes
+            from ctypes import wintypes
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            CreateMutexW = kernel32.CreateMutexW
+            CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+            CreateMutexW.restype = wintypes.HANDLE
+            GetLastError = kernel32.GetLastError
+            ERROR_ALREADY_EXISTS = 183
+            h = CreateMutexW(None, False, 'Global\\Copy2SingleInstanceMutex')
+            if h and GetLastError() == ERROR_ALREADY_EXISTS:
+                # Another instance is already running
+                return
+    except Exception:
+        pass
 
     app = Copy2App() if not USE_TTKB else Copy2App()
     app.mainloop()
