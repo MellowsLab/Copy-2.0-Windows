@@ -45,6 +45,7 @@ import time
 import zipfile
 import tempfile
 import threading
+import subprocess
 import shutil
 import webbrowser
 import base64
@@ -292,6 +293,8 @@ class Settings:
     # Advanced features (ALL disabled by default)
     advanced_features: bool = True
     adv_app_lock: bool = False
+    # Auto-lock UI after inactivity (minutes). 0 = never.
+    lock_timeout_minutes: int = 0
     adv_start_on_boot: bool = True
     adv_encrypt_exports: bool = False
     adv_encrypt_all_data: bool = False
@@ -326,6 +329,7 @@ class Settings:
         # Other advanced switches remain opt-in.
         s.advanced_features = bool(d.get("advanced_features", True))
         s.adv_app_lock = bool(d.get("adv_app_lock", False))
+        s.lock_timeout_minutes = int(d.get("lock_timeout_minutes", 0))
         s.adv_start_on_boot = bool(d.get("adv_start_on_boot", True))
         s.adv_encrypt_exports = bool(d.get("adv_encrypt_exports", False))
         s.adv_encrypt_all_data = bool(d.get("adv_encrypt_all_data", False))
@@ -338,6 +342,7 @@ class Settings:
         s.max_history = max(5, min(HARD_MAX_HISTORY, s.max_history))
         s.poll_ms = max(100, min(5000, s.poll_ms))
         s.pane_sash = max(220, min(900, s.pane_sash))
+        s.lock_timeout_minutes = max(0, min(24*60, int(getattr(s, "lock_timeout_minutes", 0))))
         s.sync_interval_sec = max(3, min(300, s.sync_interval_sec))
         if not s.tmplt_trigger_word.strip():
             s.tmplt_trigger_word = "tmplt"
@@ -613,6 +618,10 @@ class Copy2AppBase:
         self.security = sec if isinstance(sec, dict) else {}
         self._unlocked = True  # set to False on startup if App Lock is enabled and a PIN exists
         self._pin_session_verified = False
+
+        # Inactivity auto-lock (UI-only)
+        self._idle_after_id = None
+        self._idle_last_activity_ts = 0.0
 
         # If Encrypt-All is enabled and a PIN is required, defer loading encrypted stores until unlock.
         self._stores_loaded = True
@@ -1742,7 +1751,68 @@ Thanks — {signature}""",
 
     
 
+    
+
     # -----------------------------
+    # Inactivity auto-lock (UI-only)
+    # -----------------------------
+    def _bind_inactivity_listeners(self):
+        """Bind UI events to reset the inactivity timer.
+
+        Only active when Advanced Features + App Lock are enabled.
+        """
+        try:
+            self.bind_all('<Any-KeyPress>', self._on_user_activity, add='+')
+            self.bind_all('<ButtonPress>', self._on_user_activity, add='+')
+            self.bind_all('<MouseWheel>', self._on_user_activity, add='+')
+        except Exception:
+            pass
+
+    def _on_user_activity(self, event=None):
+        try:
+            self._schedule_inactivity_lock()
+        except Exception:
+            pass
+
+    def _schedule_inactivity_lock(self):
+        """(Re)schedule the UI auto-lock timer based on settings."""
+        try:
+            # Cancel existing timer
+            if getattr(self, '_idle_after_id', None) is not None:
+                try:
+                    self.after_cancel(self._idle_after_id)
+                except Exception:
+                    pass
+                self._idle_after_id = None
+
+            # Only when App Lock is enabled
+            if not (getattr(self.settings, 'advanced_features', False) and getattr(self.settings, 'adv_app_lock', False)):
+                return
+
+            minutes = int(getattr(self.settings, 'lock_timeout_minutes', 0) or 0)
+            if minutes <= 0:
+                return
+
+            # If currently locked, no need to schedule
+            if not getattr(self, '_unlocked', True):
+                return
+
+            ms = minutes * 60 * 1000
+            self._idle_after_id = self.after(ms, self._auto_lock_due_to_inactivity)
+        except Exception:
+            self._idle_after_id = None
+
+    def _auto_lock_due_to_inactivity(self):
+        """Lock UI after inactivity. Clipboard engine continues."""
+        try:
+            # If app lock not enabled anymore, do nothing
+            if not (getattr(self.settings, 'advanced_features', False) and getattr(self.settings, 'adv_app_lock', False)):
+                return
+            self._unlocked = False
+            self._show_lock_overlay(reason='Locked')
+        except Exception:
+            pass
+# -----------------------------
     # UI-only Lock Overlay (no modal dialogs, no withdraw/iconify)
     # -----------------------------
     def _require_unlocked(self, feature_name: str = "") -> bool:
@@ -1770,6 +1840,12 @@ Thanks — {signature}""",
             else:
                 self._unlocked = True
                 self._hide_lock_overlay()
+
+            # Start/refresh inactivity timer (if enabled)
+            try:
+                self._schedule_inactivity_lock()
+            except Exception:
+                pass
         except Exception:
             # Fail open visually, but do not break launch
             try:
@@ -1862,6 +1938,13 @@ Thanks — {signature}""",
             except Exception:
                 pass
 
+        # Ensure overlay is on top
+        try:
+            self._lock_overlay.lift()
+            self._lock_overlay.tkraise()
+        except Exception:
+            pass
+
         # Focus PIN field
         try:
             self._lock_entry.focus_set()
@@ -1950,7 +2033,16 @@ Thanks — {signature}""",
         except Exception:
             pass
 
-        self._hide_lock_overlay()
+        try:
+            self._hide_lock_overlay()
+        except Exception:
+            pass
+
+        # Start inactivity timer now that UI is unlocked
+        try:
+            self._schedule_inactivity_lock()
+        except Exception:
+            pass
 
     def _kdf_fernet_key(self, pin: str, salt: bytes, iters: int = 200_000) -> bytes:
         import base64
@@ -2155,6 +2247,9 @@ Thanks — {signature}""",
         """
         try:
             self.after(0, self._apply_startup_lock_overlay)
+
+            # Start inactivity timer (only does something if enabled)
+            self.after(0, self._schedule_inactivity_lock)
         except Exception:
             pass
         return True
@@ -2566,6 +2661,10 @@ Thanks — {signature}""",
                 pass
             self._refresh_list(select_last=False)
             self._persist()
+            try:
+                self._schedule_inactivity_lock()
+            except Exception:
+                pass
 
 
         return changed
@@ -2804,6 +2903,10 @@ Thanks — {signature}""",
 
             self._refresh_list(select_last=False)
             self._persist()
+            try:
+                self._schedule_inactivity_lock()
+            except Exception:
+                pass
             return len(expired)
         except Exception:
             return 0
@@ -3731,6 +3834,10 @@ Thanks — {signature}""",
             self._refresh_tag_filter_values()
             self._refresh_list()
             self._persist()
+            try:
+                self._schedule_inactivity_lock()
+            except Exception:
+                pass
             # refresh displayed common tags
             sets = [set(self.tags.get(t, [])) for t in texts]
             com = set.intersection(*sets) if sets else set()
@@ -3758,6 +3865,10 @@ Thanks — {signature}""",
             self._refresh_tag_filter_values()
             self._refresh_list()
             self._persist()
+            try:
+                self._schedule_inactivity_lock()
+            except Exception:
+                pass
             sets = [set(self.tags.get(t, [])) for t in texts]
             com = set.intersection(*sets) if sets else set()
             common_var.set(', '.join(sorted(com)) if com else '(none)')
@@ -3783,6 +3894,10 @@ Thanks — {signature}""",
                 self._persist()
                 _apply_tag_color_styling()
                 self._refresh_list()
+                try:
+                    self._schedule_inactivity_lock()
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -3802,8 +3917,13 @@ Thanks — {signature}""",
                 self._persist()
                 _apply_tag_color_styling()
                 self._refresh_list()
+                try:
+                    self._schedule_inactivity_lock()
+                except Exception:
+                    pass
             except Exception:
                 pass
+
         tk.Button(btns, text='Add/Apply', command=add_tag).pack(side=tk.LEFT)
         tk.Button(btns, text='Remove', command=remove_tag).pack(side=tk.LEFT, padx=(8,0))
         tk.Button(btns, text='Set Color…', command=set_tag_color).pack(side=tk.LEFT, padx=(8,0))
@@ -4767,6 +4887,10 @@ Thanks — {signature}""",
             self._save_images_meta()
             self._refresh_list(select_last=True)
             self._persist()
+            try:
+                self._schedule_inactivity_lock()
+            except Exception:
+                pass
             self.status_var.set(f"Imported — {path}")
 
         except Exception as e:
@@ -4903,6 +5027,45 @@ Thanks — {signature}""",
         cb_lock.grid(row=row, column=0, columnspan=2, sticky='w', padx=10, pady=6)
         btn_pin = ttk.Button(a, text='Set / Change PIN…', command=lambda: self._set_or_change_pin_flow(parent=dlg))
         btn_pin.grid(row=row, column=2, sticky='e', padx=10, pady=6)
+        row += 1
+
+        # Inactivity auto-lock (UI-only; engine keeps running)
+        cur_min = 0
+        try:
+            cur_min = int(getattr(self.settings, 'lock_timeout_minutes', 0) or 0)
+        except Exception:
+            cur_min = 0
+
+        lock_timeout_mode_var = tk.StringVar()
+        if cur_min <= 0:
+            lock_timeout_mode_var.set('Never')
+        elif cur_min == 5:
+            lock_timeout_mode_var.set('5 min')
+        else:
+            lock_timeout_mode_var.set('Custom')
+
+        lock_custom_min_var = tk.StringVar(value=str(cur_min if cur_min not in (0, 5) else 10))
+
+        ttk.Label(a, text='Auto-lock after inactivity:').grid(row=row, column=0, sticky='w', padx=10, pady=6)
+        cmb_lock = ttk.Combobox(a, textvariable=lock_timeout_mode_var, values=['Never', '5 min', 'Custom'], state='readonly', width=10)
+        cmb_lock.grid(row=row, column=1, sticky='w', padx=10, pady=6)
+        ent_lock_custom = ttk.Entry(a, textvariable=lock_custom_min_var, width=8)
+        ent_lock_custom.grid(row=row, column=2, sticky='e', padx=10, pady=6)
+
+        def _lock_timeout_ui_refresh(*_):
+            try:
+                if str(lock_timeout_mode_var.get()) == 'Custom':
+                    ent_lock_custom.configure(state='normal')
+                else:
+                    ent_lock_custom.configure(state='disabled')
+            except Exception:
+                pass
+
+        try:
+            cmb_lock.bind('<<ComboboxSelected>>', _lock_timeout_ui_refresh)
+        except Exception:
+            pass
+        _lock_timeout_ui_refresh()
         row += 1
 
         cb_boot = ttk.Checkbutton(a, text='Start on boot (Windows)', variable=adv_boot_var)
@@ -5073,6 +5236,18 @@ Thanks — {signature}""",
             self.settings.advanced_features = bool(adv_master_var.get())
             if self.settings.advanced_features:
                 self.settings.adv_app_lock = bool(adv_lock_var.get())
+                # Inactivity lock (UI-only). Only meaningful if App Lock is enabled.
+                mins = 0
+                try:
+                    mode = str(lock_timeout_mode_var.get() or 'Never')
+                    if mode == '5 min':
+                        mins = 5
+                    elif mode == 'Custom':
+                        mins = int(str(lock_custom_min_var.get()).strip())
+                        mins = max(1, min(24*60, mins))
+                except Exception:
+                    mins = 0
+                self.settings.lock_timeout_minutes = mins if self.settings.adv_app_lock else 0
                 self.settings.adv_start_on_boot = bool(adv_boot_var.get())
                 self.settings.adv_encrypt_exports = bool(adv_encrypt_var.get())
                 self.settings.adv_encrypt_all_data = bool(adv_all_var.get())
@@ -5088,6 +5263,7 @@ Thanks — {signature}""",
                 self.settings.adv_start_on_boot = False
                 self.settings.adv_encrypt_exports = False
                 self.settings.adv_encrypt_all_data = False
+                self.settings.lock_timeout_minutes = 0
                 self.settings.adv_images = False
                 self.settings.adv_screenshots = False
                 self.settings.adv_snippets = False
@@ -5103,6 +5279,7 @@ Thanks — {signature}""",
                         # Disable dependent flags
                         self.settings.adv_app_lock = False
                         self.settings.adv_encrypt_all_data = False
+                        self.settings.lock_timeout_minutes = 0
                         adv_lock_var.set(False)
                         adv_all_var.set(False)
                         messagebox.showwarning(APP_NAME, 'Feature disabled because no PIN is set.')
@@ -5141,6 +5318,12 @@ Thanks — {signature}""",
             except Exception:
                 pass
 
+            # Update inactivity timer immediately (if enabled)
+            try:
+                self._schedule_inactivity_lock()
+            except Exception:
+                pass
+
             # Re-bootstrap advanced hooks
             try:
                 self._advanced_bootstrap()
@@ -5165,6 +5348,10 @@ Thanks — {signature}""",
 
             # Persist + runtime features
             self._persist()
+            try:
+                self._schedule_inactivity_lock()
+            except Exception:
+                pass
             try:
                 self._register_global_hotkeys()
             except Exception:
@@ -5191,7 +5378,7 @@ Thanks — {signature}""",
         for v in [max_var, poll_var, sess_var, upd_var, theme_var,
                   hk_en_var, hk_qp_var, hk_pl_var,
                   sync_en_var, sync_folder_var, sync_int_var,
-                  adv_master_var, adv_lock_var, adv_boot_var, adv_encrypt_var, adv_all_var,
+                  adv_master_var, adv_lock_var, lock_timeout_mode_var, lock_custom_min_var, adv_boot_var, adv_encrypt_var, adv_all_var,
                   adv_images_var, adv_ss_var, adv_snip_var, adv_trig_var, trig_word_var]:
             try:
                 v.trace_add('write', schedule_autosave)
@@ -5569,6 +5756,10 @@ endlocal
             pass
         try:
             self._persist()
+            try:
+                self._schedule_inactivity_lock()
+            except Exception:
+                pass
         except Exception:
             pass
         try:
@@ -5596,6 +5787,7 @@ if USE_TTKB:
             # Build UI first. Locking is UI-only and applied as an overlay after launch.
             self._build_ui()
             self._bind_shortcuts()
+            self._bind_inactivity_listeners()
             self._build_context_menu()
             self._refresh_list(select_last=True)
 
@@ -5609,6 +5801,9 @@ if USE_TTKB:
 
             # Apply startup lock overlay (UI-only; engine keeps running)
             self.after(0, self._apply_startup_lock_overlay)
+
+            # Start inactivity timer (only does something if enabled)
+            self.after(0, self._schedule_inactivity_lock)
 
             # Auto-check updates on launch (non-blocking)
             if self.settings.check_updates_on_launch:
@@ -5783,25 +5978,63 @@ if USE_TTKB:
             left.rowconfigure(2, weight=1)
             left.columnconfigure(0, weight=1)
 
+            # Filters row (responsive): when the History pane is narrowed, action buttons stack underneath
             filters = tb.Frame(left)
             filters.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+            filters.columnconfigure(0, weight=1)
+            filters.columnconfigure(1, weight=0)
+
+            filters_main = tb.Frame(filters)
+            filters_main.grid(row=0, column=0, sticky="ew")
+
+            filters_actions = tb.Frame(filters)
+            filters_actions.grid(row=0, column=1, sticky="e")
 
             self.filter_var = tk.StringVar(value="all")
-            tb.Radiobutton(filters, text="All", value="all", variable=self.filter_var, command=self._refresh_list, bootstyle="toolbutton").pack(side=LEFT, padx=(0, 8))
-            tb.Radiobutton(filters, text="Favorites", value="fav", variable=self.filter_var, command=self._refresh_list, bootstyle="toolbutton").pack(side=LEFT, padx=(0, 8))
-            tb.Radiobutton(filters, text="Pinned", value="pin", variable=self.filter_var, command=self._refresh_list, bootstyle="toolbutton").pack(side=LEFT, padx=(0, 12))
+            tb.Radiobutton(filters_main, text="All", value="all", variable=self.filter_var, command=self._refresh_list, bootstyle="toolbutton").pack(side=LEFT, padx=(0, 8))
+            tb.Radiobutton(filters_main, text="Favorites", value="fav", variable=self.filter_var, command=self._refresh_list, bootstyle="toolbutton").pack(side=LEFT, padx=(0, 8))
+            tb.Radiobutton(filters_main, text="Pinned", value="pin", variable=self.filter_var, command=self._refresh_list, bootstyle="toolbutton").pack(side=LEFT, padx=(0, 12))
+            tb.Radiobutton(filters_main, text="Images", value="img", variable=self.filter_var, command=self._refresh_list, bootstyle="toolbutton").pack(side=LEFT, padx=(0, 12))
 
-            tb.Radiobutton(filters, text="Images", value="img", variable=self.filter_var, command=self._refresh_list, bootstyle="toolbutton").pack(side=LEFT, padx=(0, 12))
-
-            tb.Label(filters, text="Tag").pack(side=LEFT)
+            tb.Label(filters_main, text="Tag").pack(side=LEFT)
             self.tag_filter_var = tk.StringVar(value="")
-            self.tag_combo = tb.Combobox(filters, textvariable=self.tag_filter_var, values=[""], width=18, state="readonly")
+            self.tag_combo = tb.Combobox(filters_main, textvariable=self.tag_filter_var, values=[""], width=18, state="readonly")
             self.tag_combo.pack(side=LEFT, padx=(8, 0))
             self.tag_combo.bind("<<ComboboxSelected>>", lambda e: self._on_tag_filter_change())
 
-            btn_clean = tb.Button(filters, text="Clean", command=self._clean_keep_favorites, bootstyle=DANGER)
-            btn_clean.pack(side=RIGHT)
+            btn_clean = tb.Button(filters_actions, text="Clean", command=self._clean_keep_favorites, bootstyle=DANGER)
+            btn_clean.pack()
             ToolTip(btn_clean, "Clean (keeps favorites/pins)  (Ctrl+L)")
+
+            self._filters_compact = False
+
+            def _relayout_filters(_evt=None):
+                # If the History pane becomes too narrow, stack the action button(s) underneath.
+                try:
+                    w = int(filters.winfo_width() or 0)
+                except Exception:
+                    w = 0
+
+                threshold = 620  # tweak point where the Clean button begins to clip on small panes
+                if w and w < threshold and not self._filters_compact:
+                    self._filters_compact = True
+                    filters_actions.grid_configure(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+                    try:
+                        btn_clean.pack_forget()
+                    except Exception:
+                        pass
+                    btn_clean.pack(fill=X)
+                elif w and w >= threshold and self._filters_compact:
+                    self._filters_compact = False
+                    filters_actions.grid_configure(row=0, column=1, columnspan=1, sticky="e", pady=(0, 0))
+                    try:
+                        btn_clean.pack_forget()
+                    except Exception:
+                        pass
+                    btn_clean.pack()
+
+            filters.bind("<Configure>", _relayout_filters)
+            self.after(120, _relayout_filters)
 
             self.listbox = tk.Listbox(left, activestyle="dotbox", exportselection=False, selectmode=tk.EXTENDED)
             # Improve readability (Listbox is not ttk-themed by default)
@@ -6059,6 +6292,10 @@ if USE_TTKB:
             self._unregister_global_hotkeys()
             self._stop_sync_job()
             self._persist()
+            try:
+                self._schedule_inactivity_lock()
+            except Exception:
+                pass
             self.destroy()
 
 
@@ -6074,6 +6311,7 @@ else:
             # Build UI first. Locking is UI-only and applied as an overlay after launch.
             self._build_ui()
             self._bind_shortcuts()
+            self._bind_inactivity_listeners()
             self._build_context_menu()
             self._refresh_list(select_last=True)
 
@@ -6089,6 +6327,9 @@ else:
 
             # Apply startup lock overlay (UI-only; engine keeps running)
             self.after(0, self._apply_startup_lock_overlay)
+
+            # Start inactivity timer (only does something if enabled)
+            self.after(0, self._schedule_inactivity_lock)
 
             if self.settings.check_updates_on_launch:
                 self.after(900, lambda: self._check_updates_async(prompt_if_new=True))
@@ -6132,6 +6373,10 @@ else:
             self._unregister_global_hotkeys()
             self._stop_sync_job()
             self._persist()
+            try:
+                self._schedule_inactivity_lock()
+            except Exception:
+                pass
             self.destroy()
 
 
