@@ -46,6 +46,9 @@ Outputs:
 - If Windows SmartScreen appears: **More info → Run anyway**
 - This is a portable app: no installer, no admin required
 
+## Discord Link for support and suggestions
+- `https://discord.gg/aR7tPND2Jj`
+
 ---
 
 ## License
