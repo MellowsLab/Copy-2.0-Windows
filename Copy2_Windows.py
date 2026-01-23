@@ -53,6 +53,14 @@ import hashlib
 import secrets
 import ctypes
 
+# --- Windows taskbar identity (must be set before creating any Tk window) ---
+if os.name == "nt":
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("MellowLabs.Copy2")
+    except Exception:
+        pass
+
 # Optional: imaging (clipboard images + screenshots)
 try:
     from PIL import Image, ImageTk, ImageGrab  # type: ignore
@@ -135,7 +143,7 @@ APP_ID = "copy2"
 VENDOR = "MellowsLab"
 
 # App version (display + update compare)
-APP_VERSION = "1.0.7"  # <-- keep this in sync with your build/tag
+APP_VERSION = "1.0.8"  # <-- keep this in sync with your build/tag
 
 # History indicator icons (you can change these to any emoji you like)
 PIN_ICON = "📌"
@@ -587,6 +595,224 @@ class Copy2AppBase:
             # Back-compat if _open_settings signature differs
             self._open_settings()
 
+    # -----------------------------
+    # App icon (window/taskbar) helpers
+    # -----------------------------
+    def _get_app_icon_photo(self):
+        """Return a Tk PhotoImage for the app icon (best-effort).
+
+        Notes:
+        - Prefer PNG (native tk.PhotoImage support).
+        - If only an ICO is available, fall back to Pillow (ImageTk).
+        """
+        if getattr(self, '_app_icon_photo', None) is not None:
+            return self._app_icon_photo
+
+        img = None
+        try:
+            candidates = []
+
+            def add_candidates(base: Path):
+                # Common filenames (keep existing ones for backward compatibility)
+                candidates.extend([
+                base / "assets" / "Mellowlabs.png",
+                base / "assets" / "Mellowlabs.ico",
+                ])
+
+            # PyInstaller bundle root
+            try:
+                meipass = getattr(sys, '_MEIPASS', None)
+                if meipass:
+                    add_candidates(Path(meipass))
+            except Exception:
+                pass
+
+            #  с exe (onedir) / installed location
+            try:
+                exe_dir = Path(sys.executable).resolve().parent
+                add_candidates(exe_dir)
+            except Exception:
+                pass
+
+            # dev run (next to this .py)
+            try:
+                here = Path(__file__).resolve().parent
+                add_candidates(here)
+            except Exception:
+                pass
+
+            # 1) Try PNG first (fast, native)
+            for p in candidates:
+                try:
+                    if p.exists() and p.suffix.lower() == '.png':
+                        img = tk.PhotoImage(file=str(p))
+                        break
+                except Exception:
+                    continue
+        
+            # 2) Fall back to ICO via Pillow
+            if img is None:
+                for p in candidates:
+                    try:
+                        if p.exists() and p.suffix.lower() == '.ico' and Image is not None and ImageTk is not None:
+                            pil = Image.open(str(p))
+                            # Use the largest available frame/size when ICO contains multiple sizes.
+                            try:
+                                if getattr(pil, 'n_frames', 1) > 1:
+                                    pil.seek(pil.n_frames - 1)
+                            except Exception:
+                                pass
+                            img = ImageTk.PhotoImage(pil)
+                            break
+                    except Exception:
+                        continue
+        except Exception:
+            img = None
+
+        self._app_icon_photo = img
+        return img
+    def _apply_app_icon_to_window(self):
+    #Apply icon to the main window/taskbar (best-effort).
+    # Titlebar/top-left (ICO)
+        try:
+            ico_candidates = []
+
+            def add(base: Path):
+                ico_candidates.extend([
+                    base / "assets" / "Mellowlabs.ico",
+                    base / "Mellowlabs.ico",
+                    base / "assets" / "copy2.ico",
+                    base / "copy2.ico",
+                ])
+
+            meipass = getattr(sys, "_MEIPASS", None)
+            if meipass:
+                add(Path(meipass))
+
+            add(Path(sys.executable).resolve().parent)
+            add(Path(__file__).resolve().parent)
+
+            for p in ico_candidates:
+                if p.exists():
+                    self.iconbitmap(str(p))
+                    break
+        except Exception:
+            pass
+
+    # Taskbar/window icon (PNG preferred)
+    try:
+        png_candidates = []
+
+        def addp(base: Path):
+            png_candidates.extend([
+                base / "assets" / "Mellowlabs.png",
+                base / "Mellowlabs.png",
+                base / "assets" / "copy2.png",
+                base / "copy2.png",
+                base / "assets" / "Image 4.png",
+                base / "Image 4.png",
+            ])
+
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            addp(Path(meipass))
+
+        addp(Path(sys.executable).resolve().parent)
+        addp(Path(__file__).resolve().parent)
+
+        for p in png_candidates:
+            if p.exists() and p.suffix.lower() == ".png":
+                img = tk.PhotoImage(file=str(p))
+                self.iconphoto(True, img)
+                self._app_icon_photo = img  # keep reference alive
+                break
+    except Exception:
+        pass
+
+    
+
+    def _get_lock_logo_photo(self, max_size: int = 96):
+        """Return a smaller PhotoImage for the lock screen logo.
+
+        Uses the app icon image, but downsizes it so it cannot overlap the unlock UI.
+        Best-effort; falls back to the raw icon if resizing is not possible.
+        """
+        if getattr(self, '_lock_logo_photo', None) is not None:
+            return self._lock_logo_photo
+
+        try:
+            ico = self._get_app_icon_photo()
+        except Exception:
+            ico = None
+
+        if ico is None:
+            self._lock_logo_photo = None
+            return None
+
+        # If we have Pillow available, do a true resize for consistent results.
+        try:
+            from PIL import Image, ImageTk  # type: ignore
+            # Try to locate the PNG used for the icon so we can resize it properly.
+            # If not found, fall back to subsample.
+            src_path = None
+            try:
+                candidates = []
+                def add_candidates(base: Path):
+                    candidates.extend([base / "assets" / "Mellowlabs.png"])
+                try:
+                    meipass = getattr(sys, '_MEIPASS', None)
+                    if meipass:
+                        add_candidates(Path(meipass))
+                except Exception:
+                    pass
+                try:
+                    exe_dir = Path(sys.executable).resolve().parent
+                    add_candidates(exe_dir)
+                except Exception:
+                    pass
+                try:
+                    here = Path(__file__).resolve().parent
+                    add_candidates(here)
+                except Exception:
+                    pass
+                for p in candidates:
+                    try:
+                        if p.exists():
+                            src_path = p
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                src_path = None
+
+            if src_path is not None:
+                im = Image.open(str(src_path)).convert("RGBA")
+                w, h = im.size
+                scale = max(w / float(max_size), h / float(max_size), 1.0)
+                nw, nh = max(1, int(w / scale)), max(1, int(h / scale))
+                im = im.resize((nw, nh), Image.LANCZOS)
+                self._lock_logo_photo = ImageTk.PhotoImage(im)
+                return self._lock_logo_photo
+        except Exception:
+            pass
+
+        # Fallback: tk.PhotoImage subsample (rough but safe)
+        try:
+            w = int(ico.width())
+            h = int(ico.height())
+            factor = int(math.ceil(max(w, h) / float(max_size)))
+            if factor < 1:
+                factor = 1
+            if factor > 1:
+                small = ico.subsample(factor, factor)
+            else:
+                small = ico
+            self._lock_logo_photo = small
+            return self._lock_logo_photo
+        except Exception:
+            self._lock_logo_photo = ico
+            return ico
+
     def _init_state(self):
         self.data_dir = Path(user_data_dir(APP_ID, VENDOR))
         self.settings_path = self.data_dir / "config.json"
@@ -596,6 +822,8 @@ class Copy2AppBase:
         self.tags_path = self.data_dir / "tags.json"
         self.tag_colors_path = self.data_dir / "tag_colors.json"
         self.expiry_path = self.data_dir / "expiry.json"
+        # Rich text/format preservation store (Windows clipboard HTML/RTF formats)
+        self.formats_path = self.data_dir / "formats.json"
         # Advanced feature storage (optional)
         self.security_path = self.data_dir / "security.json"
         self.images_dir = self.data_dir / "images"
@@ -612,6 +840,9 @@ class Copy2AppBase:
         self.log_update_install = self.data_dir / "update_install.log"
 
         self.settings = Settings.from_dict(safe_json_load(self.settings_path, {}))
+
+        # Rich formats map: key = the stored text value, value = dict with optional html_b64/rtf_b64
+        self.clip_formats = {}
 
         # Advanced runtime state (optional features are OFF by default)
         sec = safe_json_load(self.security_path, {})
@@ -886,6 +1117,198 @@ class Copy2AppBase:
         except Exception:
             pass
 
+    # -----------------------------
+    # Nuke PIN (emergency local wipe)
+    # -----------------------------
+    def _nuke_pin_is_set(self) -> bool:
+        try:
+            salt = str(self.security.get('nuke_pin_salt') or '').strip()
+            h = str(self.security.get('nuke_pin_hash') or '').strip()
+            return bool(salt and h)
+        except Exception:
+            return False
+
+    def _verify_nuke_pin_value(self, pin: str) -> bool:
+        try:
+            if not self._nuke_pin_is_set():
+                return False
+            salt = str(self.security.get('nuke_pin_salt') or '')
+            iters = int(self.security.get('nuke_pin_iters') or 250_000)
+            expected = str(self.security.get('nuke_pin_hash') or '')
+            got = self._pin_hash(str(pin or '').strip(), salt, iters)
+            # constant-time compare
+            try:
+                return secrets.compare_digest(got, expected)
+            except Exception:
+                return got == expected
+        except Exception:
+            return False
+
+    def _set_or_change_nuke_pin_flow(self, parent=None):
+        """Set/Change the Nuke PIN (requires current app PIN first)."""
+        parent = parent or self
+
+        # Require current PIN (prevents takeover)
+        if not self._pin_session_verified:
+            cur = simpledialog.askstring(APP_NAME, 'Enter current PIN (required)', parent=parent, show='*')
+            if cur is None:
+                return
+            if not self._verify_pin_value(cur):
+                messagebox.showerror(APP_NAME, 'Incorrect PIN.')
+                return
+            self._pin_session_verified = True
+
+        a = simpledialog.askstring(APP_NAME, 'Set Nuke PIN', parent=parent, show='*')
+        if a is None:
+            return
+        b = simpledialog.askstring(APP_NAME, 'Confirm Nuke PIN', parent=parent, show='*')
+        if b is None:
+            return
+        if a != b:
+            messagebox.showerror(APP_NAME, 'Nuke PINs do not match.')
+            return
+        if len(a.strip()) < 4:
+            messagebox.showerror(APP_NAME, 'Nuke PIN must be at least 4 characters.')
+            return
+
+        # Stronger defaults; still PBKDF2 via existing helper
+        salt = base64.b64encode(secrets.token_bytes(16)).decode('utf-8')
+        iters = 250_000
+        h = self._pin_hash(a.strip(), salt, iters)
+        self.security['nuke_pin_salt'] = salt
+        self.security['nuke_pin_iters'] = iters
+        self.security['nuke_pin_hash'] = h
+        self._save_security()
+        messagebox.showinfo(APP_NAME, 'Nuke PIN updated.')
+
+    def _secure_overwrite_file(self, path: Path, passes: int = 1):
+        """Best-effort overwrite then delete. Note: cannot guarantee on SSDs/cloud."""
+        try:
+            if not path.exists() or not path.is_file():
+                return
+            try:
+                size = path.stat().st_size
+            except Exception:
+                size = None
+
+            if size is None or size <= 0:
+                try:
+                    path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                return
+
+            # Overwrite with random bytes (best-effort)
+            for _ in range(max(1, int(passes))):
+                try:
+                    with open(path, 'r+b', buffering=0) as f:
+                        remaining = int(size)
+                        chunk = 1024 * 1024
+                        while remaining > 0:
+                            n = chunk if remaining >= chunk else remaining
+                            f.write(secrets.token_bytes(n))
+                            remaining -= n
+                        try:
+                            f.flush()
+                            os.fsync(f.fileno())
+                        except Exception:
+                            pass
+                except Exception:
+                    break
+
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _secure_delete_tree(self, root: Path):
+        try:
+            if not root.exists():
+                return
+            if root.is_file():
+                self._secure_overwrite_file(root, passes=1)
+                return
+            # Walk files first
+            for p in sorted(root.rglob('*'), key=lambda x: len(str(x)), reverse=True):
+                try:
+                    if p.is_file():
+                        self._secure_overwrite_file(p, passes=1)
+                    else:
+                        try:
+                            p.rmdir()
+                        except Exception:
+                            pass
+                except Exception:
+                    continue
+            try:
+                root.rmdir()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _nuke_wipe_everything(self):
+        """Wipe all local app data + sync copies, then exit.
+
+        NOTE: This is a destructive action intended for the Nuke PIN path.
+        Per requirements, it performs the wipe immediately with no additional prompts.
+        """
+        try:
+            # Stop periodic jobs first
+            try:
+                self._stop_sync_job()
+            except Exception:
+                pass
+            try:
+                if getattr(self, '_idle_after_id', None) is not None:
+                    self.after_cancel(self._idle_after_id)
+            except Exception:
+                pass
+
+            # Clear in-memory state quickly (best-effort)
+            try:
+                self.history = deque([], maxlen=getattr(self.settings, 'max_history', DEFAULT_MAX_HISTORY))
+            except Exception:
+                pass
+            try:
+                self.favorites = []
+                self.pins = []
+                self.tags = {}
+                self.expiry = {}
+            except Exception:
+                pass
+
+            # Wipe local data directory
+            try:
+                self._secure_delete_tree(Path(self.data_dir))
+            except Exception:
+                pass
+
+            # Wipe sync folder copies (known filenames)
+            try:
+                if self._sync_enabled():
+                    folder = Path(str(self.settings.sync_folder)).expanduser()
+                    for _local, fname in self._sync_paths():
+                        try:
+                            self._secure_overwrite_file(folder / fname, passes=1)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        finally:
+            # No UI indication for nuke path (silent exit)
+            try:
+                self.destroy()
+            except Exception:
+                try:
+                    os._exit(0)
+                except Exception:
+                    pass
+
+
     def _set_or_change_pin_flow(self, parent=None):
         parent = parent or self
         # Always require the current PIN before changing it (prevents silent PIN takeover).
@@ -922,6 +1345,7 @@ class Copy2AppBase:
         self._save_security()
         messagebox.showinfo(APP_NAME, 'PIN updated.')
 
+
     def _prompt_unlock_dialog(self) -> bool:
         """Blocking unlock dialog. Returns True if unlocked, else False (Exit)."""
         dlg = tk.Toplevel(self)
@@ -954,6 +1378,22 @@ class Copy2AppBase:
 
         def do_unlock(_evt=None):
             p = pin_var.get() or ''
+            # Nuke PIN: emergency wipe (if configured)
+            try:
+                if self._verify_nuke_pin_value(p):
+                    try:
+                        pin_var.set('')
+                    except Exception:
+                        pass
+                    try:
+                        dlg.destroy()
+                    except Exception:
+                        pass
+                    self._nuke_wipe_everything()
+                    return
+            except Exception:
+                pass
+
             if self._verify_pin_value(p):
                 result['ok'] = True
                 # Cache PIN in-memory for this session so encrypted-at-rest stores can be read.
@@ -1765,6 +2205,14 @@ Thanks — {signature}""",
             self.bind_all('<Any-KeyPress>', self._on_user_activity, add='+')
             self.bind_all('<ButtonPress>', self._on_user_activity, add='+')
             self.bind_all('<MouseWheel>', self._on_user_activity, add='+')
+            # Additional signals (some widgets don't emit MouseWheel/KeyPress reliably)
+            self.bind_all('<Motion>', self._on_user_activity, add='+')
+            self.bind_all('<ButtonRelease>', self._on_user_activity, add='+')
+            self.bind_all('<KeyRelease>', self._on_user_activity, add='+')
+            try:
+                self.bind('<FocusIn>', self._on_user_activity, add='+')
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -1803,17 +2251,111 @@ Thanks — {signature}""",
             self._idle_after_id = None
 
     def _auto_lock_due_to_inactivity(self):
-        """Lock UI after inactivity. Clipboard engine continues."""
+        """Lock UI after inactivity.
+
+        This must lock the *entire* UI surface, including any open dialogs (Settings, Quick Paste, etc.).
+        Clipboard engine continues running in the background.
+        """
         try:
             # If app lock not enabled anymore, do nothing
             if not (getattr(self.settings, 'advanced_features', False) and getattr(self.settings, 'adv_app_lock', False)):
                 return
+
+            # Mark locked first (so new dialogs/features are gated)
             self._unlocked = False
+
+            # Ensure secondary windows cannot remain interactive on top of the lock overlay
+            try:
+                self._close_non_main_windows_on_lock()
+            except Exception:
+                pass
+
+            # Show overlay on the root window
             self._show_lock_overlay(reason='Locked')
+
+            # Keep the main window above any remaining windows
+            try:
+                self.lift()
+                self.focus_force()
+            except Exception:
+                pass
         except Exception:
             pass
+
+    def _close_non_main_windows_on_lock(self):
+        """Hide/disable any open Toplevel windows so the lock applies globally.
+
+        Uses a robust enumeration of Tk toplevel children so dialogs created with different masters
+        are still captured.
+        """
+        try:
+            self._withdrawn_on_lock = []
+        except Exception:
+            self._withdrawn_on_lock = []
+
+        # Enumerate all toplevel children under the Tk root ('.')
+        names = []
+        try:
+            names = list(self.tk.call('winfo', 'children', '.'))
+        except Exception:
+            names = []
+
+        for n in names:
+            try:
+                w = self.nametowidget(n)
+            except Exception:
+                continue
+            try:
+                # Skip self (the main root)
+                if w is self:
+                    continue
+            except Exception:
+                pass
+            try:
+                if isinstance(w, (tk.Toplevel, tk.Tk)) and w.winfo_exists():
+                    try:
+                        st = str(w.state() or '')
+                    except Exception:
+                        st = ''
+                    if st == 'withdrawn':
+                        continue
+                    try:
+                        self._withdrawn_on_lock.append(w)
+                    except Exception:
+                        pass
+                    try:
+                        w.withdraw()
+                    except Exception:
+                        try:
+                            w.attributes('-disabled', True)
+                        except Exception:
+                            pass
+            except Exception:
+                continue
+
+    def _restore_windows_after_unlock(self):
+        """Restore any windows that were withdrawn when the app locked."""
+        ws = getattr(self, '_withdrawn_on_lock', None) or []
+        try:
+            self._withdrawn_on_lock = []
+        except Exception:
+            pass
+        for w in ws:
+            try:
+                if w is not None and w.winfo_exists():
+                    try:
+                        w.attributes('-disabled', False)
+                    except Exception:
+                        pass
+                    try:
+                        w.deiconify()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
 # -----------------------------
-    # UI-only Lock Overlay (no modal dialogs, no withdraw/iconify)
+    # UI-only Lock Overlay (no modal dialogs, no withdraw/iconify) (no modal dialogs, no withdraw/iconify)
     # -----------------------------
     def _require_unlocked(self, feature_name: str = "") -> bool:
         """Gate UI-only features while locked. Engine (clipboard polling) must continue."""
@@ -1827,6 +2369,54 @@ Thanks — {signature}""",
         except Exception:
             pass
         return False
+
+    def _install_lock_blocker_bindings_once(self):
+        """Bind global input blockers so the entire app becomes non-interactive while locked.
+
+        This protects against cases where a widget/dialog remains above the overlay or where geometry results
+        in partial coverage. The blocker allows events only within the lock overlay subtree.
+        """
+        if getattr(self, '_lock_blocker_bound', False):
+            return
+        self._lock_blocker_bound = True
+
+        def blocker(event):
+            # Only block when locked
+            try:
+                if getattr(self, '_unlocked', True):
+                    return
+            except Exception:
+                pass
+
+            ov = getattr(self, '_lock_overlay', None)
+            if ov is None:
+                return "break"
+
+            try:
+                w = event.widget
+                # Allow interactions inside the lock overlay
+                if w == ov or str(w).startswith(str(ov)):
+                    return
+            except Exception:
+                pass
+
+            return "break"
+
+        self._lock_blocker_fn = blocker
+
+        # Broad set of common UI inputs
+        seqs = [
+            '<ButtonPress>', '<ButtonRelease>',
+            '<Button-1>', '<Button-2>', '<Button-3>',
+            '<Double-Button-1>',
+            '<KeyPress>', '<KeyRelease>',
+            '<MouseWheel>',
+        ]
+        for s in seqs:
+            try:
+                self.bind_all(s, blocker, add='+')
+            except Exception:
+                pass
 
     def _apply_startup_lock_overlay(self):
         """Apply startup lock if App Lock and/or Encrypt-All requires it.
@@ -1878,6 +2468,25 @@ Thanks — {signature}""",
         card.place(relx=0.5, rely=0.5, anchor='center')
 
         # Branding
+        # Icon above app name (best-effort)
+        try:
+            ico = self._get_lock_logo_photo()
+        except Exception:
+            ico = None
+        if ico is not None:
+            try:
+                icon_lbl = tk.Label(card, image=ico)
+                icon_lbl.image = ico  # keep ref
+                try:
+                    colors = getattr(self, 'style', None).colors if getattr(self, 'style', None) is not None else None
+                    if colors is not None:
+                        icon_lbl.configure(bg=colors.bg)
+                except Exception:
+                    pass
+                icon_lbl.pack(padx=24, pady=(12, 6))
+            except Exception:
+                pass
+
         title = tk.Label(card, text="Copy 2.0", font=("Segoe UI", 22, "bold"))
         subtitle = tk.Label(card, text="Enter PIN to unlock", font=("Segoe UI", 11))
         try:
@@ -1887,8 +2496,8 @@ Thanks — {signature}""",
                 subtitle.configure(bg=colors.bg, fg=colors.fg)
         except Exception:
             pass
-        title.pack(padx=24, pady=(18, 6))
-        subtitle.pack(padx=24, pady=(0, 14))
+        title.pack(padx=24, pady=(0, 4) if ico is not None else (14, 4))
+        subtitle.pack(padx=24, pady=(0, 10))
 
         # PIN entry
         pin_var = tk.StringVar(value="")
@@ -1916,6 +2525,12 @@ Thanks — {signature}""",
         except Exception:
             pass
 
+        # Ensure global lock input blocker is installed (one-time)
+        try:
+            self._install_lock_blocker_bindings_once()
+        except Exception:
+            pass
+
         self._lock_overlay = ov
         self._lock_pin_var = pin_var
         self._lock_err_var = err_var
@@ -1929,6 +2544,13 @@ Thanks — {signature}""",
         except Exception:
             pass
 
+
+        # Always clear the PIN field when showing the lock screen
+        try:
+            if getattr(self, '_lock_pin_var', None) is not None:
+                self._lock_pin_var.set('')
+        except Exception:
+            pass
         # Cover the full client area; blocks interaction with underlying UI
         try:
             self._lock_overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
@@ -1965,6 +2587,24 @@ Thanks — {signature}""",
         except Exception:
             pass
 
+        # Clear PIN/error fields so they are never retained between locks
+        try:
+            if getattr(self, '_lock_pin_var', None) is not None:
+                self._lock_pin_var.set('')
+        except Exception:
+            pass
+        try:
+            if getattr(self, '_lock_err_var', None) is not None:
+                self._lock_err_var.set('')
+        except Exception:
+            pass
+        # Restore any dialogs that were withdrawn during lock
+        try:
+            self._restore_windows_after_unlock()
+        except Exception:
+            pass
+
+
     def _attempt_unlock_from_overlay(self, pin_var: tk.StringVar, err_var: tk.StringVar):
         pin = ''
         try:
@@ -1982,6 +2622,19 @@ Thanks — {signature}""",
             except Exception:
                 pass
             return
+
+        # Nuke PIN: emergency wipe (if configured)
+        try:
+            if self._verify_nuke_pin_value(pin):
+                # Clear entry quickly, then wipe
+                try:
+                    pin_var.set('')
+                except Exception:
+                    pass
+                self._nuke_wipe_everything()
+                return
+        except Exception:
+            pass
 
         if not self._verify_pin_value(pin):
             try:
@@ -2284,6 +2937,11 @@ Thanks — {signature}""",
         except Exception:
             self.expiry = {}
         try:
+            fmts = self._store_load_json(self.formats_path, {})
+            self.clip_formats = fmts if isinstance(fmts, dict) else {}
+        except Exception:
+            self.clip_formats = {}
+        try:
             meta = self._store_load_json(self.images_meta_path, [])
             self.images = meta if isinstance(meta, list) else []
         except Exception:
@@ -2329,6 +2987,11 @@ Thanks — {signature}""",
         self._store_save_json(self.tags_path, self.tags)
         self._store_save_json(self.tag_colors_path, getattr(self, "tag_colors", {}))
         self._store_save_json(self.expiry_path, self.expiry)
+        # Rich clipboard formats (HTML/RTF)
+        try:
+            self._store_save_json(self.formats_path, getattr(self, 'clip_formats', {}) or {})
+        except Exception:
+            pass
 
 
     # -----------------------------
@@ -2427,6 +3090,181 @@ Thanks — {signature}""",
         except Exception:
             return False
 
+    def _clipboard_get_rich_payload(self) -> dict:
+        """Return a payload containing text plus optional HTML/RTF clipboard formats.
+
+        This is Windows-only best-effort. On non-Windows platforms, returns text only.
+        """
+        out = {"text": "", "html": None, "rtf": None}
+        try:
+            out["text"] = self._clipboard_get_text()
+        except Exception:
+            out["text"] = ""
+
+        try:
+            if os.name != 'nt':
+                return out
+        except Exception:
+            return out
+
+        try:
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+
+            CF_UNICODETEXT = 13
+            fmt_html = user32.RegisterClipboardFormatW("HTML Format")
+            fmt_rtf = user32.RegisterClipboardFormatW("Rich Text Format")
+
+            if not user32.OpenClipboard(None):
+                return out
+            try:
+                # HTML
+                try:
+                    if fmt_html:
+                        h = user32.GetClipboardData(fmt_html)
+                        if h:
+                            p = kernel32.GlobalLock(h)
+                            if p:
+                                try:
+                                    sz = kernel32.GlobalSize(h)
+                                    out["html"] = ctypes.string_at(p, sz)
+                                finally:
+                                    kernel32.GlobalUnlock(h)
+                except Exception:
+                    pass
+
+                # RTF
+                try:
+                    if fmt_rtf:
+                        h = user32.GetClipboardData(fmt_rtf)
+                        if h:
+                            p = kernel32.GlobalLock(h)
+                            if p:
+                                try:
+                                    sz = kernel32.GlobalSize(h)
+                                    out["rtf"] = ctypes.string_at(p, sz)
+                                finally:
+                                    kernel32.GlobalUnlock(h)
+                except Exception:
+                    pass
+
+                # If Unicode text was not available via pyperclip/Tk (rare), attempt it here
+                try:
+                    if not out.get("text"):
+                        htxt = user32.GetClipboardData(CF_UNICODETEXT)
+                        if htxt:
+                            p = kernel32.GlobalLock(htxt)
+                            if p:
+                                try:
+                                    out["text"] = ctypes.wstring_at(p)
+                                finally:
+                                    kernel32.GlobalUnlock(htxt)
+                except Exception:
+                    pass
+            finally:
+                try:
+                    user32.CloseClipboard()
+                except Exception:
+                    pass
+        except Exception:
+            return out
+        return out
+
+    def _clipboard_set_rich_text(self, text_value: str) -> bool:
+        """Set clipboard using the stored HTML/RTF formats for this text when available.
+
+        Falls back to plain text when:
+        - not on Windows
+        - no stored formats exist for the given text
+        - clipboard API fails
+        """
+        t = text_value if isinstance(text_value, str) else str(text_value)
+        try:
+            if os.name != 'nt':
+                return self._clipboard_set_text(t)
+        except Exception:
+            return self._clipboard_set_text(t)
+
+        rec = None
+        try:
+            rec = (getattr(self, 'clip_formats', {}) or {}).get(t)
+        except Exception:
+            rec = None
+        if not isinstance(rec, dict):
+            return self._clipboard_set_text(t)
+
+        html_b64 = rec.get('html_b64')
+        rtf_b64 = rec.get('rtf_b64')
+        want_any = bool(isinstance(html_b64, str) and html_b64) or bool(isinstance(rtf_b64, str) and rtf_b64)
+        if not want_any:
+            return self._clipboard_set_text(t)
+
+        try:
+            import base64
+            html = base64.b64decode(html_b64.encode('ascii')) if isinstance(html_b64, str) and html_b64 else None
+            rtf = base64.b64decode(rtf_b64.encode('ascii')) if isinstance(rtf_b64, str) and rtf_b64 else None
+        except Exception:
+            html = rtf = None
+        if html is None and rtf is None:
+            return self._clipboard_set_text(t)
+
+        try:
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+
+            GMEM_MOVEABLE = 0x0002
+            CF_UNICODETEXT = 13
+            fmt_html = user32.RegisterClipboardFormatW("HTML Format")
+            fmt_rtf = user32.RegisterClipboardFormatW("Rich Text Format")
+
+            if not user32.OpenClipboard(None):
+                return self._clipboard_set_text(t)
+            try:
+                user32.EmptyClipboard()
+
+                def _set_bytes(fmt, data: bytes):
+                    if not fmt or not data:
+                        return
+                    h = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+                    if not h:
+                        return
+                    p = kernel32.GlobalLock(h)
+                    if not p:
+                        kernel32.GlobalFree(h)
+                        return
+                    try:
+                        ctypes.memmove(p, data, len(data))
+                    finally:
+                        kernel32.GlobalUnlock(h)
+                    user32.SetClipboardData(fmt, h)
+
+                # Text (always)
+                try:
+                    data_u16 = (t + "\0").encode('utf-16le')
+                    _set_bytes(CF_UNICODETEXT, data_u16)
+                except Exception:
+                    pass
+
+                # Rich formats (optional)
+                try:
+                    if isinstance(html, (bytes, bytearray)) and html:
+                        _set_bytes(fmt_html, bytes(html))
+                except Exception:
+                    pass
+                try:
+                    if isinstance(rtf, (bytes, bytearray)) and rtf:
+                        _set_bytes(fmt_rtf, bytes(rtf))
+                except Exception:
+                    pass
+            finally:
+                try:
+                    user32.CloseClipboard()
+                except Exception:
+                    pass
+            return True
+        except Exception:
+            return self._clipboard_set_text(t)
+
 
     # -----------------------------
     # Global hotkeys (optional) & sync
@@ -2487,7 +3325,7 @@ Thanks — {signature}""",
         if not self.history:
             return
         item = list(self.history)[-1]
-        if not self._clipboard_set_text(item):
+        if not self._clipboard_set_rich_text(item):
             return
 
         if _kbd is None:
@@ -2516,6 +3354,7 @@ Thanks — {signature}""",
             (self.pins_path, 'pins.json'),
             (self.tags_path, 'tags.json'),
             (self.expiry_path, 'expiry.json'),
+            (self.formats_path, 'formats.json'),
         ]
 
     def _sync_now(self):
@@ -2646,6 +3485,27 @@ Thanks — {signature}""",
                     else:
                         # conservative: earliest expiry wins
                         self.expiry[k] = min(float(self.expiry.get(k) or ts), ts)
+                changed += 1
+            elif fname == 'formats.json' and isinstance(data, dict):
+                # merge stored rich formats (prefer local if present; fill missing from remote)
+                try:
+                    for k, v in data.items():
+                        if not isinstance(k, str):
+                            continue
+                        if not isinstance(v, dict):
+                            continue
+                        cur = (getattr(self, 'clip_formats', {}) or {}).get(k)
+                        if not isinstance(cur, dict):
+                            cur = {}
+                        merged = dict(cur)
+                        if 'html_b64' not in merged and isinstance(v.get('html_b64'), str):
+                            merged['html_b64'] = v.get('html_b64')
+                        if 'rtf_b64' not in merged and isinstance(v.get('rtf_b64'), str):
+                            merged['rtf_b64'] = v.get('rtf_b64')
+                        if merged:
+                            (getattr(self, 'clip_formats', {}) or {})[k] = merged
+                except Exception:
+                    pass
                 changed += 1
 
             last[fname] = r_mtime
@@ -2798,14 +3658,29 @@ Thanks — {signature}""",
                 except Exception:
                     pass
 
-                text = self._clipboard_get_text()
-                if isinstance(text, str):
-                    text = text.strip("\r\n")
-                else:
-                    text = ""
+                payload = self._clipboard_get_rich_payload()
+                text = payload.get('text') if isinstance(payload, dict) else ''
+                text = text if isinstance(text, str) else ''
 
                 if text and text != self.last_clip:
                     self.last_clip = text
+
+                    # Store rich clipboard formats for this text (HTML/RTF) when present
+                    try:
+                        import base64
+                        html = payload.get('html') if isinstance(payload, dict) else None
+                        rtf = payload.get('rtf') if isinstance(payload, dict) else None
+                        rec = {}
+                        # Avoid huge blobs (keeps formats.json from exploding)
+                        if isinstance(html, (bytes, bytearray)) and 1 <= len(html) <= 300_000:
+                            rec['html_b64'] = base64.b64encode(bytes(html)).decode('ascii')
+                        if isinstance(rtf, (bytes, bytearray)) and 1 <= len(rtf) <= 300_000:
+                            rec['rtf_b64'] = base64.b64encode(bytes(rtf)).decode('ascii')
+                        if rec:
+                            (getattr(self, 'clip_formats', {}) or {})[text] = rec
+                    except Exception:
+                        pass
+
                     # If Encrypt-All stores are deferred (locked at startup), keep capturing but buffer in memory
                     try:
                         if not bool(getattr(self, '_stores_loaded', True)):
@@ -3546,10 +4421,19 @@ Thanks — {signature}""",
             return
 
         # Text: if the user has selected a range in Preview, copy only that range.
+        # Otherwise, copy the selected history item (with rich formatting if available).
         try:
             if self.preview.tag_ranges('sel'):
                 out = self.preview.get('sel.first', 'sel.last')
             else:
+                st = self._get_selected_text()
+                if isinstance(st, str) and st:
+                    if self._clipboard_set_rich_text(st):
+                        try:
+                            self.status_var.set(f"Copied — {now_ts()}")
+                        except Exception:
+                            pass
+                        return
                 out = self.preview.get("1.0", tk.END)
         except Exception:
             out = self.preview.get("1.0", tk.END)
@@ -3965,7 +4849,7 @@ Thanks — {signature}""",
             return
         t = list(self.history)[-1]
         try:
-            self._clipboard_set_text(t)
+            self._clipboard_set_rich_text(t)
         except Exception:
             return
         if _kbd is None:
@@ -4079,7 +4963,7 @@ Thanks — {signature}""",
             if not t:
                 return
             try:
-                self._clipboard_set_text(t)
+                self._clipboard_set_rich_text(t)
             except Exception:
                 return
             win.destroy()
@@ -5027,6 +5911,12 @@ Thanks — {signature}""",
         cb_lock.grid(row=row, column=0, columnspan=2, sticky='w', padx=10, pady=6)
         btn_pin = ttk.Button(a, text='Set / Change PIN…', command=lambda: self._set_or_change_pin_flow(parent=dlg))
         btn_pin.grid(row=row, column=2, sticky='e', padx=10, pady=6)
+
+        # Separate Nuke PIN control (emergency wipe)
+        row += 1
+        ttk.Label(a, text='Nuke PIN (wipes all local + sync data)').grid(row=row, column=0, columnspan=2, sticky='w', padx=10, pady=2)
+        btn_nuke = ttk.Button(a, text='Set / Change NUKE PIN…', command=lambda: self._set_or_change_nuke_pin_flow(parent=dlg))
+        btn_nuke.grid(row=row, column=2, sticky='e', padx=10, pady=2)
         row += 1
 
         # Inactivity auto-lock (UI-only; engine keeps running)
@@ -5774,10 +6664,11 @@ endlocal
 if USE_TTKB:
 
     class Copy2App(tb.Window, Copy2AppBase):
-        def __init__(self):
+        def __init__(self, *args, **kwargs):
             tmp_settings = Settings.from_dict(safe_json_load(Path(user_data_dir(APP_ID, VENDOR)) / "config.json", {}))
             theme = tmp_settings.theme if tmp_settings.theme else "flatly"
-            super().__init__(themename=theme)
+            super().__init__(themename=theme, *args, **kwargs)
+            self._apply_app_icon_to_window()
             self._active_theme = theme
 
             self.title(APP_NAME)
@@ -6304,6 +7195,8 @@ else:
     class Copy2App(tk.Tk, Copy2AppBase):
         def __init__(self):
             super().__init__()
+            # Apply window/taskbar icon (best-effort; requires Image 4.png next to the exe or bundled)
+            self._apply_app_icon_to_window()
             self.title(APP_NAME)
             self._init_state()
             self.minsize(1100, 720)

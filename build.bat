@@ -1,5 +1,6 @@
 @echo off
 setlocal
+cd /d "%~dp0"
 
 REM Build Copy 2.0 Portable EXE (one-file, no console)
 
@@ -19,8 +20,12 @@ if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
 if exist Copy2.spec del /q Copy2.spec
 
-python -m PyInstaller --noconsole --onefile --name "Copy2" Copy2_Windows.py
-python -m PyInstaller --noconsole --onefile --name "Copy2_Uninstall" Copy2_Uninstall.py
+set ICON=C:\Users\Ethan\Documents\Programming projects\Copy2Win\assets\Mellowlabs.ico
+
+python -m PyInstaller --noconsole --onefile --name "Copy2" --icon "%ICON%" --add-data "assets;assets" Copy2_Windows.py
+python -m PyInstaller --noconsole --onefile --name "Copy2_Uninstall" --icon "%ICON%" --add-data "assets;assets" Copy2_Uninstall.py
+
+
 
 
 echo.
